@@ -5,23 +5,14 @@ define alignment=2;
 define space ram type=ram_space size=3 default;
 define space register type=register_space size=1;
 
+define register offset=0x0 size=2 [R0 R1 R2 R3 R4 R5 FP SP PC];
 
-define register offset=0xf size=2 [r0 r1 r2 r3 r4 r5 fp sp sr pc];
+# The SR has 8 flags.
+# Taking a cue from x86, define pseudo-registers for each flag
+# separately; otherwise decompilation is a mess
+define register offset=0x20 size=1 [T I2 I1 I0 N Z V C];
 
-define register offset=0x100 size=1 [cp dp ep tp br];
-
-# SR Flags
-@define T_FLAG   "sr[15,1]"
-@define I0_FLAG  "sr[8,1]"
-@define I1_FLAG  "sr[9,1]"
-@define I2_FLAG  "sr[10,1]"
-@define N_FLAG   "sr[3,1]"
-@define Z_FLAG   "sr[2,1]"
-@define V_FLAG   "sr[1,1]"
-@define C_FLAG   "sr[0,1]"
-
-
-
+define register offset=0x30 size=1 [CP DP EP TP BR];
 
 define token instruction_1byte(8)
 	opcode_8=(0,7)
