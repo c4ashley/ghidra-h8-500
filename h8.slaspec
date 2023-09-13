@@ -1,0 +1,186 @@
+define endian=big;
+
+define alignment=2;
+
+define space ram type=ram_space size=2 default;
+define space register type=register_space size=2;
+
+
+define space address type=ram_space size=3;
+
+define register offset=0xf size=2 [r0 r1 r2 r3 r4 r5 fp sp sr pc];
+
+define register offset=0x100 size=1 [cp dp ep tp br];
+
+# SR Flags
+@define T_FLAG   "sr[15,1]"
+@define I0_FLAG  "sr[8,1]"
+@define I1_FLAG  "sr[9,1]"
+@define I2_FLAG  "sr[10,1]"
+@define N_FLAG   "sr[3,1]"
+@define Z_FLAG   "sr[2,1]"
+@define V_FLAG   "sr[1,1]"
+@define C_FLAG   "sr[0,1]"
+
+
+
+
+define token instruction_1byte(8)
+	opcode_8=(0,7)
+;
+
+define token instruction_2byte(16)
+	opcode_16=(0,3)
+	operand_size_16=(4,4)
+	imm8_16=(8,15)	
+	address_mode_16=(0,3)
+	register_16=(5,7)
+	opcode_wholeword = (0,15)
+	opcode_firstbyte = (0,7)
+	immediate_value_byte = (8,15)
+	opcode_00_04 = (0,4)
+	register_05_07 = (5,7)
+	opcode_08_15 = (8,15)
+;
+
+define token instruction_3byte(24)
+	opcode_24=(0,3)
+	operand_size_24=(4,4)
+	register_24=(5,7)
+	imm16_24=(16,23)
+	adisp16_8b=(16,23)
+	opcode1_24bit = (0,7)
+	opcode2_24b_5b = (8,12)
+;
+
+define token instruction_4byte(32)
+	opcode1_32bit = (0,7)
+	address_24bit = (8,31)
+	address_16bit = (8,23)
+	opcode2_32bit = (24,31)
+;
+
+
+macro push(val) {
+	*[register]:2 sp = val;
+	sp = sp-2;
+}
+	
+macro pop(val) {
+	sp = sp+2;
+	val = *[register]:2 sp;
+}
+
+macro setResultFlags(result) {
+	# TODO: Complete me
+	$(Z_flag) = (result == 0);
+	$(S_flag) = (result s< 0);
+}
+
+attach variables [  register_05_07 register_24 register_16 ] [ r0 r1 r2 r3 r4 r5 fp sp ];
+
+##################################
+Reg: loc		is simm8  [ loc = inst_next + simm8; ]		{ export *:1 loc; }
+
+##################################
+############### DATA #############
+:mov.i.w imm16_24,register_24             is opcode_24=0b0101 & operand_size_24=1 & register_24 & imm16_24
+{
+	register_24 = imm16_24;
+}
+
+:mov.e.b imm8_16,register_16             is opcode_16=0b0101 & operand_size_16=0 & register_16 & imm8_16
+{
+	register_16 = imm8_16;
+}
+
+
+
+##################### BRANCH ####################
+:pjsr    @address_24bit  is opcode1_32bit=0x03 & address_24bit
+{
+    # TODO: Mark code-page stack push # https://downloads.laboratoryb.org/insight/documents/H8/H8_500_programming.pdf#page=94
+	push(pc);
+	pc = &address_24bit;
+	call  [address_24bit:3];
+}
+
+:pjmp    @address_24bit  is opcode1_32bit=0x13 & address_24bit
+{
+   # TODO: Mark update of code page register https://downloads.laboratoryb.org/insight/documents/H8/H8_500_programming.pdf#page=93
+	pc = &address_24bit;
+	call  [address_24bit:3];
+}
+
+
+:scb.f Rc,@adisp16_8b is opcode1_24bit=0x01 & opcode2_24b_5b = 0x17 & adisp16_8b
+{
+	# TODO: Mark up the loop effect of SCB/F correctly
+    Rc = Rc - 1;
+   	push(pc);
+	pc = &address_24bit;
+	call  [address_24bit:3];
+}
+
+
+:prts   is opcode_wholeword=0x1119
+{
+	pop(pc);
+	return [pc];
+}
+
+##################### LOGICAL OPERATIONS ####################
+:and.b RdFull,RrFull is opcode_08_15 opciode1_24bit=0x04 & address_ {
+	RdFull = RdFull & RrFull;
+	# TODO: Properly capture Vflag
+	#$(Vflag) = 0;
+	setResultFlags(RdFull);
+}
+
+
+##################### SYSTEM CONTROL ####################
+define pcodeop nop;
+:nop is opcode_8=0x0 
+{
+	nop();
+}
+
+
+define pcodeop sleep;
+:sleep is opcode_8=0b0011010 {
+	sleep();
+}
+
+
+:link  is opcode_firstbyte=0x17 & immediate_value_byte
+{
+		r0 = r0;
+}
+
+
+:unlk is opcode_8=0x0f
+{
+	sp = fp;
+	pop(sp);
+}
+
+
+##################### ARITHMETIC OPERATIONS ####################
+:extu.b is opcode_00_04=0b10100 & register_05_07 & opcode_08_15=0b00010010
+{
+		register_05_07 = register_05_07 ^ 0xFF ;
+}
+
+
+:cmp.i.w imm16_24,register_24             is opcode_24=0b0100 & operand_size_24=1 & register_24 & imm16_24
+{
+	#TODO
+	register_24 = imm16_24;
+}
+
+:cmp.e.b imm8_16,register_16             is opcode_16=0b0100 & operand_size_16=0 & register_16 & imm8_16
+{
+	#TODO
+	register_16 = imm8_16;
+}
+
