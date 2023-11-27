@@ -14,32 +14,25 @@ define register offset=0x20 size=1 [T I2 I1 I0 N Z V C];
 
 define register offset=0x30 size=1 [CP DP EP TP BR];
 
-define token instruction_1byte(8)
-	opcode_8=(0,7)
+# Address mode stuff
+# see https://downloads.laboratoryb.org/insight/documents/H8/H8_500_programming.pdf#page=27
+define token data8 (8)
+    amode  = (0,3)
+    asz    = (4)   # Literally just Sz from pg27
+    arn    = (5,7) # which register
+    disp8   = (0,7)
+    addr8  = (0,7)
+    imm8   = (0,7)
 ;
 
-define token instruction_2byte(16)
-	opcode_16=(0,3)
-	operand_size_16=(4,4)
-	imm8_16=(8,15)	
-	address_mode_16=(0,3)
-	register_16=(5,7)
-	opcode_wholeword = (0,15)
-	opcode_firstbyte = (0,7)
-	immediate_value_byte = (8,15)
-	opcode_00_04 = (0,4)
-	register_05_07 = (5,7)
-	opcode_08_15 = (8,15)
+define token data16 (16) # For when you have two bytes of address or displacement in your extension
+    disp16 = (0,15)
+    addr16 = (0,15)
+    imm16  = (0,15)
 ;
 
-define token instruction_3byte(24)
-	opcode_24=(0,3)
-	operand_size_24=(4,4)
-	register_24=(5,7)
-	imm16_24=(16,23)
-	adisp16_8b=(16,23)
-	opcode1_24bit = (0,7)
-	opcode2_24b_5b = (8,12)
+define token op8 (8)
+    # No fucking clue what I'd put here to say which operator is used
 ;
 
 
