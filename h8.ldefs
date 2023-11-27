@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<language_definitions>
+  <language processor="H8"
+            endian="big"
+            size="16"
+            variant="H8/538F"
+            version="1.0"
+            slafile="h8538f.sla"
+            processorspec="h8538f.pspec"
+            id="H8:BE:16:H8538F">
+    <description>H8/538F processor</description>
+    <compiler name="default" spec="h8.cspec" id="default"/>
+  </language>
+</language_definitions>
