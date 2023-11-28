@@ -2,7 +2,7 @@ define endian=big;
 
 define alignment=2;
 
-define space ram type=ram_space size=3 default;
+define space ram type=ram_space size=2 default;
 define space register type=register_space size=1;
 
 define register offset=0x0 size=2 [R0 R1 R2 R3 R4 R5 FP SP PC];
