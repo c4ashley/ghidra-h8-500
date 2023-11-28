@@ -18,7 +18,7 @@ define register offset=0x30 size=1 [CP DP EP TP BR];
 # see https://downloads.laboratoryb.org/insight/documents/H8/H8_500_programming.pdf#page=27
 define token data8 (8)
     amode  = (0,3)
-    asz    = (4)   # Literally just Sz from pg27
+    asz    = (4,4)   # Literally just Sz from pg27
     arn    = (5,7) # which register
     disp8   = (0,7)
     addr8  = (0,7)
@@ -31,8 +31,10 @@ define token data16 (16) # For when you have two bytes of address or displacemen
     imm16  = (0,15)
 ;
 
-define token op8 (8)
+define token op (8)
     # No fucking clue what I'd put here to say which operator is used
+    op8 = (0,7)
 ;
 
 
+:MOV.W is op8=0x5f { }
