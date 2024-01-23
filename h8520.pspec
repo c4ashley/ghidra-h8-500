@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<processor_spec>
+  <programcounter register="PC"/>
+  <data_space space="ram" />
+  <context_data>
+	  <!--<tracked_set space="ram">
+		  <set name="doPseudo" val="0"/>
+	  </tracked_set>-->
+	  <tracked_set space="ram">
+  		<set name="TP" val="0"/>
+	  </tracked_set>
+	  <tracked_set space="ram">
+  		<set name="FPH" val="0"/>
+	  </tracked_set>
+	  <!--<tracked_set space="ram">
+		  <set name="FP" val="0" />
+	  </tracked_set>-->
+  	<tracked_set space="ram">
+  		<set name="EP" val="0"/>
+  	</tracked_set>
+  	<tracked_set space="ram">
+		<set name="CP" val="0"/>
+  	</tracked_set>
+  	<tracked_set space="ram">
+  		<set name="BR" val="0"/>
+  	</tracked_set>
+  	<tracked_set space="ram">
+  		<set name="DP" val="0"/>
+  	</tracked_set>
+	<!--<tracked_set space="ram">
+	</tracked_set>-->
+  </context_data>
+  <register_data>
+    <register name="R0" />
+    <register name="R1" />
+    <register name="R2" />
+    <register name="R3" />
+    <register name="R4" />
+    <register name="R5" />
+    <register name="SP" />
+    <register name="FP" />
+
+    <register name="BR" />
+    <register name="TP" />
+    <register name="EP" />
+    <register name="CP" />
+    <register name="DP" />
+
+	<register name="SP24" hidden="true" />
+	<register name="FP24" hidden="true" />
+    <register name="TPH"  hidden="true" />
+
+	<!--<register name="controlL" hidden="true" />
+	<register name="controlH" hidden="true" />-->
+  </register_data>
+  <!--<default_memory_blocks>
+    <memory_block name="ram" start_address="ram:0x20000" length="0x8000" mode="rw" initialized="false"/>
+    <memory_block name="ram" start_address="ram:0x0000" length="0x1ffff" mode="rx" initialized="false"/>
+  </default_memory_blocks>-->
+  <!--<global> // defined in h8.cspec
+	  <range space="ram"/>
+  </global>-->
+  <default_symbols>
+	  <!-- interrupt vector table -->
+    <symbol name="reset_vector"    address="ram:0x0000" type="code_ptr" entry="true"/>
+    <symbol name="badinstr_vector" address="ram:0x0008" type="code_ptr" entry="true"/>
+    <symbol name="div0_vector"     address="ram:0x000C" type="code_ptr" entry="true"/>
+    <symbol name="trap_vector"     address="ram:0x0010" type="code_ptr" entry="true"/>
+    <symbol name="badaddr_vector"  address="ram:0x0020" type="code_ptr" entry="true"/>
+    <symbol name="trace_vector"    address="ram:0x0024" type="code_ptr" entry="true"/>
+    <symbol name="nmi_vector"      address="ram:0x002C" type="code_ptr" entry="true"/>
+    <symbol name="trapa0_vector"   address="ram:0x0040" type="code_ptr" entry="true"/>
+    <symbol name="trapa1_vector"   address="ram:0x0044" type="code_ptr" entry="true"/>
+    <symbol name="trapa2_vector"   address="ram:0x0048" type="code_ptr" entry="true"/>
+    <symbol name="trapa3_vector"   address="ram:0x004C" type="code_ptr" entry="true"/>
+    <symbol name="trapa4_vector"   address="ram:0x0050" type="code_ptr" entry="true"/>
+    <symbol name="trapa5_vector"   address="ram:0x0054" type="code_ptr" entry="true"/>
+    <symbol name="trapa6_vector"   address="ram:0x0058" type="code_ptr" entry="true"/>
+    <symbol name="trapa7_vector"   address="ram:0x005C" type="code_ptr" entry="true"/>
+    <symbol name="trapa8_vector"   address="ram:0x0060" type="code_ptr" entry="true"/>
+    <symbol name="trapa9_vector"   address="ram:0x0064" type="code_ptr" entry="true"/>
+    <symbol name="trapa10_vector"  address="ram:0x0068" type="code_ptr" entry="true"/>
+    <symbol name="trapa11_vector"  address="ram:0x006C" type="code_ptr" entry="true"/>
+    <symbol name="trapa12_vector"  address="ram:0x0070" type="code_ptr" entry="true"/>
+    <symbol name="trapa13_vector"  address="ram:0x0074" type="code_ptr" entry="true"/>
+    <symbol name="trapa14_vector"  address="ram:0x0078" type="code_ptr" entry="true"/>
+    <symbol name="trapa15_vector"  address="ram:0x007C" type="code_ptr" entry="true"/>
+    <symbol name="irq0_wdt_vector" address="ram:0x0080" type="code_ptr" entry="true"/>
+    <symbol name="irq1_vector"     address="ram:0x0084" type="code_ptr" entry="true"/>
+    <symbol name="irq2_vector"     address="ram:0x0088" type="code_ptr" entry="true"/>
+    <symbol name="irq3_vector"     address="ram:0x008c" type="code_ptr" entry="true"/>
+    <symbol name="irq4_vector"     address="ram:0x0090" type="code_ptr" entry="true"/>
+    <symbol name="irq5_vector"     address="ram:0x0094" type="code_ptr" entry="true"/>
+    <symbol name="irq6_vector"     address="ram:0x0098" type="code_ptr" entry="true"/>
+    <symbol name="irq7_vector"     address="ram:0x009C" type="code_ptr" entry="true"/>
+    <symbol name="FRT1_ICI_vector"   address="ram:0x00A0" type="code_ptr" entry="true"/>
+    <symbol name="FRT1_OCIA_vector"  address="ram:0x00A4" type="code_ptr" entry="true"/>
+    <symbol name="FRT1_OCIB_vector"  address="ram:0x00A8" type="code_ptr" entry="true"/>
+    <symbol name="FRT1_FOVI__vector" address="ram:0x00AC" type="code_ptr" entry="true"/>
+    <symbol name="FRT2_ICI_vector"   address="ram:0x00B0" type="code_ptr" entry="true"/>
+    <symbol name="FRT2_OCIA_vector"  address="ram:0x00B4" type="code_ptr" entry="true"/>
+    <symbol name="FRT2_OCIB_vector"  address="ram:0x00B8" type="code_ptr" entry="true"/>
+    <symbol name="FRT2_FOVI_vector"  address="ram:0x00BC" type="code_ptr" entry="true"/>
+    <symbol name="Timer_CMIA_vector" address="ram:0x00C0" type="code_ptr" entry="true"/>
+    <symbol name="Timer_CMIB_vector" address="ram:0x00C4" type="code_ptr" entry="true"/>
+    <symbol name="Timer_OVI_vector"  address="ram:0x00C8" type="code_ptr" entry="true"/>
+    <symbol name="SCI1_ERI_vector"   address="ram:0x00D0" type="code_ptr" entry="true"/>
+    <symbol name="SCI1_RXI_vector"   address="ram:0x00D4" type="code_ptr" entry="true"/>
+    <symbol name="SCI1_TXI_vector"   address="ram:0x00D8" type="code_ptr" entry="true"/>
+    <symbol name="SCI2_ERI_vector"   address="ram:0x00E0" type="code_ptr" entry="true"/>
+    <symbol name="SCI2_RXI_vector"   address="ram:0x00E4" type="code_ptr" entry="true"/>
+    <symbol name="SCI2_TXI_vector"   address="ram:0x00E8" type="code_ptr" entry="true"/>
+    <symbol name="ADC_ADI_vector"    address="ram:0x00D0" type="code_ptr" entry="true"/>
+	<!-- SFR registers -->
+	<symbol name="P1DDR" address="ram:0xFF80" entry="false" />
+	<symbol name="P2DDR" address="ram:0xFF81" entry="false" />
+	<symbol name="P1DR" address="ram:0xFF82" entry="false" />
+	<symbol name="P2DR" address="ram:0xFF83" entry="false" />
+	<symbol name="P3DDR" address="ram:0xFF84" entry="false" />
+	<symbol name="P4DDR" address="ram:0xFF85" entry="false" />
+	<symbol name="P3DR"  address="ram:0xFF86" entry="false" />
+	<symbol name="P4DR"  address="ram:0xFF87" entry="false" />
+	<symbol name="P5DDR" address="ram:0xFF88" entry="false" />
+    <!--<symbol name="" address="ram:0xFF89" entry="false" />-->
+	<symbol name="P5DR" address="ram:0xFF8A" entry="false" />
+	<symbol name="P6DR" address="ram:0xFF8B" entry="false" />
+	<symbol name="P7DDR" address="ram:0xFF8C" entry="false" />
+	  <!--<symbol name="" address="ram:0xFF8D" entry="false" />-->
+	<symbol name="P7DR" address="ram:0xFF8E" entry="false" />
+	  <!--<symbol name="" address="ram:0xFF8F" entry="false" />-->
+	<symbol name="TCR" address="ram:0xFF90" entry="false" />
+	<symbol name="TCSR" address="ram:0xFF91" entry="false" />
+	<symbol name="FRCH" address="ram:0xFF92" entry="false" />
+	<symbol name="FRCL" address="ram:0xFF93" entry="false" />
+	<symbol name="OCRAH" address="ram:0xFF94" entry="false" />
+	<symbol name="OCRAL" address="ram:0xFF95" entry="false" />
+	<symbol name="OCRBH" address="ram:0xFF96" entry="false" />
+	<symbol name="OCRBL" address="ram:0xFF97" entry="false" />
+	<symbol name="ICRH" address="ram:0xFF98" entry="false" />
+	<symbol name="ICRL" address="ram:0xFF99" entry="false" />
+	<!--<symbol name="" address="ram:0xFF9A" entry="false" />
+	<symbol name="" address="ram:0xFF9B" entry="false" />
+	<symbol name="" address="ram:0xFF9C" entry="false" />
+	<symbol name="" address="ram:0xFF9D" entry="false" />
+	<symbol name="" address="ram:0xFF9E" entry="false" />
+	<symbol name="" address="ram:0xFF9F" entry="false" />-->
+	<symbol name="TCR" address="ram:0xFFA0" entry="false" />
+	<symbol name="ICF" address="ram:0xFFA1" entry="false" />
+	<symbol name="FRCH" address="ram:0xFFA2" entry="false" />
+	<symbol name="FRCL" address="ram:0xFFA3" entry="false" />
+	<symbol name="OCRAH" address="ram:0xFFA4" entry="false" />
+	<symbol name="OCRAL" address="ram:0xFFA5" entry="false" />
+	<symbol name="OCRBH" address="ram:0xFFA6" entry="false" />
+	<symbol name="OCRBL" address="ram:0xFFA7" entry="false" />
+	<symbol name="ICRH" address="ram:0xFFA8" entry="false" />
+	<symbol name="ICRL" address="ram:0xFFA9" entry="false" />
+	<!--<symbol name="" address="ram:0xFFAA" entry="false" />
+	<symbol name="" address="ram:0xFFAB" entry="false" />
+	<symbol name="" address="ram:0xFFAC" entry="false" />
+	<symbol name="" address="ram:0xFFAD" entry="false" />
+	<symbol name="" address="ram:0xFFAE" entry="false" />
+	<symbol name="" address="ram:0xFFAF" entry="false" />
+	<symbol name="" address="ram:0xFFB0" entry="false" />
+	<symbol name="" address="ram:0xFFB1" entry="false" />
+	<symbol name="" address="ram:0xFFB2" entry="false" />
+	<symbol name="" address="ram:0xFFB3" entry="false" />
+	<symbol name="" address="ram:0xFFB4" entry="false" />
+	<symbol name="" address="ram:0xFFB5" entry="false" />
+	<symbol name="" address="ram:0xFFB6" entry="false" />
+	<symbol name="" address="ram:0xFFB7" entry="false" />
+	<symbol name="" address="ram:0xFFB8" entry="false" />
+	<symbol name="" address="ram:0xFFB9" entry="false" />
+	<symbol name="" address="ram:0xFFBA" entry="false" />
+	<symbol name="" address="ram:0xFFBB" entry="false" />
+	<symbol name="" address="ram:0xFFBC" entry="false" />
+	<symbol name="" address="ram:0xFFBD" entry="false" />
+	<symbol name="" address="ram:0xFFBE" entry="false" />
+	<symbol name="" address="ram:0xFFBF" entry="false" />-->
+	<symbol name="SMR" address="ram:0xFFC0" entry="false" />
+	<symbol name="BRR" address="ram:0xFFC1" entry="false" />
+	<symbol name="SCR" address="ram:0xFFC2" entry="false" />
+	<symbol name="TDR" address="ram:0xFFC3" entry="false" />
+	<symbol name="SSR" address="ram:0xFFC4" entry="false" />
+	<symbol name="RDR" address="ram:0xFFC5" entry="false" />
+	<!--<symbol name="" address="ram:0xFFC6" entry="false" />
+	<symbol name="" address="ram:0xFFC7" entry="false" />
+	<symbol name="" address="ram:0xFFC8" entry="false" />
+	<symbol name="" address="ram:0xFFC9" entry="false" />
+	<symbol name="" address="ram:0xFFCA" entry="false" />
+	<symbol name="" address="ram:0xFFCB" entry="false" />
+	<symbol name="" address="ram:0xFFCC" entry="false" />
+	<symbol name="" address="ram:0xFFCD" entry="false" />
+	<symbol name="" address="ram:0xFFCE" entry="false" />
+	<symbol name="" address="ram:0xFFCF" entry="false" />-->
+	<symbol name="TCR" address="ram:0xFFD0" entry="false" />
+	<symbol name="TCSR" address="ram:0xFFD1" entry="false" />
+	<symbol name="TCORA" address="ram:0xFFD2" entry="false" />
+	<symbol name="TCORB" address="ram:0xFFD3" entry="false" />
+	<symbol name="TCNT" address="ram:0xFFD4" entry="false" />
+	<!--<symbol name="" address="ram:0xFFD5" entry="false" />
+	<symbol name="" address="ram:0xFFD6" entry="false" />
+	<symbol name="" address="ram:0xFFD7" entry="false" />-->
+	<symbol name="SMR" address="ram:0xFFD8" entry="false" />
+	<symbol name="BRR" address="ram:0xFFD9" entry="false" />
+	<symbol name="SCR" address="ram:0xFFDA" entry="false" />
+	<symbol name="TDR" address="ram:0xFFDB" entry="false" />
+	<symbol name="SSR" address="ram:0xFFDC" entry="false" />
+	<symbol name="RDR" address="ram:0xFFDD" entry="false" />
+	<!--<symbol name="" address="ram:0xFFDE" entry="false" />
+	<symbol name="" address="ram:0xFFDF" entry="false" />-->
+	<symbol name="ADDRAH" address="ram:0xFFE0" entry="false" />
+	<symbol name="ADDRAL" address="ram:0xFFE1" entry="false" />
+	<symbol name="ADDRBH" address="ram:0xFFE2" entry="false" />
+	<symbol name="ADDRBL" address="ram:0xFFE3" entry="false" />
+	<symbol name="ADDRCH" address="ram:0xFFE4" entry="false" />
+	<symbol name="ADDRCL" address="ram:0xFFE5" entry="false" />
+	<symbol name="ADDRDH" address="ram:0xFFE6" entry="false" />
+	<symbol name="ADDRDL" address="ram:0xFFE7" entry="false" />
+	<symbol name="ADDCSR" address="ram:0xFFE8" entry="false" />
+	<symbol name="ADCR" address="ram:0xFFE9" entry="false" />
+	<!--<symbol name="" address="ram:0xFFEA" entry="false" />
+	<symbol name="" address="ram:0xFFEB" entry="false" />-->
+	<symbol name="TCSR" address="ram:0xFFEC" entry="false" />
+	<symbol name="TCNT" address="ram:0xFFED" entry="false" />
+	<!--<symbol name="" address="ram:0xFFEE" entry="false" />
+	<symbol name="" address="ram:0xFFEF" entry="false" />-->
+	<symbol name="IPRA" address="ram:0xFFF0" entry="false" />
+	<symbol name="IPRB" address="ram:0xFFF1" entry="false" />
+	<symbol name="IPRC" address="ram:0xFFF2" entry="false" />
+	<symbol name="IPRD" address="ram:0xFFF3" entry="false" />
+	<symbol name="DTEA" address="ram:0xFFF4" entry="false" />
+	<symbol name="DTEB" address="ram:0xFFF5" entry="false" />
+	<symbol name="DTEC" address="ram:0xFFF6" entry="false" />
+	<symbol name="DTED" address="ram:0xFFF7" entry="false" />
+	<symbol name="WCR" address="ram:0xFFF8" entry="false" />
+	<symbol name="RAMCR" address="ram:0xFFF9" entry="false" />
+	<symbol name="MDCR" address="ram:0xFFFA" entry="false" />
+	<symbol name="SBYCR" address="ram:0xFFFB" entry="false" />
+	<symbol name="NMICR" address="ram:0xFFFC" entry="false" />
+	<symbol name="IRQCR" address="ram:0xFFFD" entry="false" />
+	<symbol name="WDTPWD" address="ram:0xFFFE" entry="false" />
+	<symbol name="RSTCSR" address="ram:0xFFFF" entry="false" />
+  </default_symbols>
+</processor_spec>

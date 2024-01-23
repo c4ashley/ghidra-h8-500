@@ -1,0 +1,30 @@
+Function prologue with FP-based frame
+0x17 0x..       link     #..:8
+0x12 0x..       stm      (..), @-SP
+0xaf 0x0d       add:q.w  #-2, SP
+0xd7 0x9c       stc.b    EP, @SP
+0xe7 0x01 0x9d  stc.b    DP, @(0x1,SP)
+
+
+Function epilogue with FP-based frame
+0xd7 0x8c       ldc.b    @SP,EP
+0xe7 0x01 0x8d  ldc.b    @(0x1:8,SP),DP
+0xaf 0x09       add:q.w  #2,SP
+0x02 0x20       ldm.w    @SP+,(R5 )
+0x0f            unlk     FP
+[...]          [return]
+
+
+Return patterns
+0x11 0x19       prts
+  or
+0x11 0x14 0x..  prtd     #..:8
+  or
+0x11 0x1c 0x....  prtd   #..:16
+  or
+0x19            rts
+  or
+                rtd      #..:8
+  or
+                rtd      #..:16
+

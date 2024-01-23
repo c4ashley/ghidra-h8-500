@@ -1,0 +1,1796 @@
+# TODO: Need to somehow make it so that SR/CCR is accessible in the decompiler.
+#       For high-level C programming, it makes sense that system registers, like R0, PC, FP, DP, are inaccessible.
+#       But this one has our interrupt control, so we need to be able to access it.
+
+# NOTE: Whenever an instruction modifies the stack, such as LINK, JSR, and even STM (..),@-SP,
+#       the stack only gets adjusted in its 16-bit value, causing problems for the programmer
+#       if an over/underflow occurs. I think it's safe to assume that an average program will
+#       not have this problem, and Ghidra seems to have trouble following the stack in this way.
+#       As such, I have simplified stack operations to operate on the full 24-bit address, so
+#       Ghidra can more easily track the stack depth as it changes throughout a function.
+
+define endian=big;
+
+define alignment=1;
+
+#define space DATA type=ram_space size=4;
+#define space CODE type=ram_space size=4 default;
+define space ram type=ram_space size=3 default;
+define space register type=register_space size=1;
+
+define register offset=0x0 size=2 [ R0  R1  R2  R3  R4  R5   _    FP    _   _    SP];
+define register offset=0x0 size=1 [_ _ _ _ _ _ _ _ _ _ _ _ _ FPH _ _ _ _ _ TP _ _];
+define register offset=0x0d size=3 [FP24];
+define register offset=0x13 size=3 [SP24];
+define register offset=0x20 size=2 [_ SR];
+define register offset=0x20 size=1 [_ _ _ CCR _ DP EP _ BR];
+define register offset=0x40 size=4 [contextreg];
+define register offset=0x60 size=1 [CF VF ZF NF];
+define register offset=0x80 size=1 [CP];
+define register offset=0x80 size=3 [PC];
+define register offset=0x81 size=2 [PC16];
+
+define context contextreg
+	targetBase = (0,2)
+	targetReg = (0,2);
+
+#@define CF    "SR[0,1]"
+#@define VF    "SR[1,1]"
+#@define ZF    "SR[2,1]"
+#@define NF    "SR[3,1]"
+@define CF    "CF"
+@define VF    "VF"
+@define ZF    "ZF"
+@define NF    "NF"
+@define IMASK "SR[8,3]"
+@define TF    "SR[15,1]"
+
+@define DIV0VECTOR "0x10"
+
+# The SR has 8 flags.
+# Taking a cue from x86, define pseudo-registers for each flag
+# separately; otherwise decompilation is a mess
+# define register offset=0x20 size=1 [T IMASK N Z V C];
+
+define token addrMode(8)
+	Rn = (0, 2)
+	Rnb = (0, 2)
+	sz = (3, 3)
+	mode = (4, 7)
+;
+define token instr8(8)
+	Rd = (0,2)
+	Rdb = (0,2)
+	Rs = (0,2)
+	Rsb = (0,2)
+	CR8 = (0,2)
+	CR16= (0,2)
+	opcode = (3,7)
+	opcode47 = (4,7)
+	op_imm4 = (0,3)
+	cond = (0,3)
+;
+define token special(8)
+	opcode_special = (0,7)
+;
+
+define token addrByte(8)    addr8  = (0, 7);
+define token addrWord(16)   addr16 = (0, 15);
+define token addrLong(24)   addr24 = (0, 23);
+define token pageByte(8)    page   = (0, 7);
+define token dispByte(8)    disp8  = (0,7)  signed;
+define token dispWord(16)   disp16 = (0,15) signed;
+define token immByte(8)     imm8   = (0,7);
+define token immWord(16)    imm16  = (0,15);
+define token regListByte(8)
+	reglist  = (0,7)
+	reglist0 = (0,0)
+	reglist1 = (1,1)
+	reglist2 = (2,2)
+	reglist3 = (3,3)
+	reglist4 = (4,4)
+	reglist5 = (5,5)
+	reglist6 = (6,6)
+	reglist7 = (7,7)
+	;
+
+
+attach variables [ Rd Rs Rn ]    [ R0  R1  R2  R3  R4  R5  FP  SP  ];
+#attach variables [ Rdb Rsb Rnb ] [ R0L R1L R2L R3L R4L R5L FPL SPL ];
+#attach names [ targetReg ] [ R0  R1  R2  R3  R4  R5  FP  SP  ];
+
+attach variables [ CR8 ]         [ _   CCR _   BR  EP  DP  _   TP  ];
+attach variables [ CR16 ]        [ SR  _   _   _   _   _   _   _   ];
+#attach variables [ targetBase ]   [ DP DP DP DP EP EP TP TP ];
+
+attach names [sz] [ "b" "w" ];
+#attach names [Rdb Rnb] [ "R0" "R1" "R2" "R3" "R4" "R5" "FP" "SP" ];
+
+attach names [reglist] [
+                         ""      "R0"        "R1"       "R0-R1"       "R2"    "R0,R2"    "R1-R2"     "R0-R2"     # 0-7
+                         "R3"    "R0,R3"     "R1,R3"    "R0-R1,R3"    "R2-R3" "R0,R2-R3" "R1-R3"     "R0-R3"     # 08-0F
+                         "R4"    "R0,R4"     "R1,R4"    "R0-R1,R4"    "R2,R4" "R0,R2,R4" "R1-R2,R4"  "R0-R2,R4"  # 10-17
+                         "R3-R4" "R0,R3-R4"  "R1,R3-R4"  "R0-R1,R3-R4" "R2-R4" "R0,R2-R4" "R1-R4"     "R0-R4"     # 18-1F
+
+                         "R5"    "R0,R5"     "R1,R5"    "R0-R1,R5"    "R2,R5"    "R0,R2,R5"    "R1-R2,R5"     "R0-R2,R5"
+                         "R3,R5" "R0,R3,R5"  "R1,R3,R5" "R0-R1,R3,R5" "R2-R3,R5" "R0,R2-R3,R5" "R1-R3,R5"     "R0-R3,R5" 
+                         "R4-R5" "R0,R4-R5"  "R1,R4-R5" "R0-R1,R4-R5" "R2,R4-R5" "R0,R2,R4-R5" "R1-R2,R4-R5"  "R0-R2,R4-R5" 
+                         "R3-R5" "R0,R3-R5"  "R1,R3-R5" "R0-R1,R3-R5" "R2-R5"    "R0,R2-R5"    "R1-R5"        "R0-R5" 
+
+                         "FP"       "R0,FP"       "R1,FP"       "R0-R1,FP"       "R2,FP"    "R0,R2,FP"    "R1-R2,FP"     "R0-R2,FP"
+                         "R3,FP"    "R0,R3,FP"    "R1,R3,FP"    "R0-R1,R3,FP"    "R2-R3,FP" "R0,R2-R3,FP" "R1-R3,FP"     "R0-R3,FP" 
+                         "R4,FP"    "R0,R4,FP"    "R1,R4,FP"    "R0-R1,R4,FP"    "R2,R4,FP" "R0,R2,R4,FP" "R1-R2,R4,FP"  "R0-R2,R4,FP" 
+                         "R3-R4,FP" "R0,R3-R4,FP" "R1,R3-R4,FP" "R0-R1,R3-R4,FP" "R2-R4,FP" "R0,R2-R4,FP" "R1-R4,FP"     "R0-R4,FP" 
+
+                         "R5,FP"    "R0,R5,FP"    "R1,R5,FP"    "R0-R1,R5,FP"    "R2,R5,FP"    "R0,R2,R5,FP"    "R1-R2,R5,FP"    "R0-R2,R5,FP"
+                         "R3,R5,FP" "R0,R3,R5,FP" "R1,R3,R5,FP" "R0-R1,R3,R5,FP" "R2-R3,R5,FP" "R0,R2-R3,R5,FP" "R1-R3,R5,FP"    "R0-R3,R5,FP" 
+                         "R4-R5,FP" "R0,R4-R5,FP" "R1,R4-R5,FP" "R0-R1,R4-R5,FP" "R2,R4-R5,FP" "R0,R2,R4-R5,FP" "R1-R2,R4-R5,FP" "R0-R2,R4-R5,FP" 
+                         "R3-R5,FP" "R0,R3-R5,FP" "R1,R3-R5,FP" "R0-R1,R3-R5,FP" "R2-R5,FP"    "R0,R2-R5,FP"    "R1-R5,FP"       "R0-R5,FP" 
+
+                         "SP"       "R0,SP"       "R1,SP"       "R0-R1,SP"       "R2,SP"    "R0,R2,SP"    "R1-R2,SP"    "R0-R2,SP"
+                         "R3,SP"    "R0,R3,SP"    "R1,R3,SP"    "R0-R1,R3,SP"    "R2-R3,SP" "R0,R2-R3,SP" "R1-R3,SP"    "R0-R3,SP" 
+                         "R4,SP"    "R0,R4,SP"    "R1,R4,SP"    "R0-R1,R4,SP"    "R2,R4,SP" "R0,R2,R4,SP" "R1-R2,R4,SP" "R0-R2,R4,SP" 
+                         "R3-R4,SP" "R0,R3-R4,SP" "R1,R3-R4,SP" "R0-R1,R3-R4,SP" "R2-R4,SP" "R0,R2-R4,SP" "R1-R4,SP"    "R0-R4,SP" 
+
+                         "R5,SP"    "R0,R5,SP"    "R1,R5,SP"    "R0-R1,R5,SP"    "R2,R5,SP"    "R0,R2,R5,SP"    "R1-R2,R5,SP"    "R0-R2,R5,SP"
+                         "R3,R5,SP" "R0,R3,R5,SP" "R1,R3,R5,SP" "R0-R1,R3,R5,SP" "R2-R3,R5,SP" "R0,R2-R3,R5,SP" "R1-R3,R5,SP"    "R0-R3,R5,SP" 
+                         "R4-R5,SP" "R0,R4-R5,SP" "R1,R4-R5,SP" "R0-R1,R4-R5,SP" "R2,R4-R5,SP" "R0,R2,R4-R5,SP" "R1-R2,R4-R5,SP" "R0-R2,R4-R5,SP" 
+                         "R3-R5,SP" "R0,R3-R5,SP" "R1,R3-R5,SP" "R0-R1,R3-R5,SP" "R2-R5,SP"    "R0,R2-R5,SP"    "R1-R5,SP"       "R0-R5,SP" 
+
+                         "FP,SP"       "R0,FP,SP"       "R1,FP,SP"       "R0-R1,FP,SP"       "R2,FP,SP"    "R0,R2,FP,SP"    "R1-R2,FP,SP" "R0-R2,FP,SP"
+                         "R3,FP,SP"    "R0,R3,FP,SP"    "R1,R3,FP,SP"    "R0-R1,R3,FP,SP"    "R2-R3,FP,SP" "R0,R2-R3,FP,SP" "R1-R3,FP,SP" "R0-R3,FP,SP" 
+                         "R4,FP,SP"    "R0,R4,FP,SP"    "R1,R4,FP,SP"    "R0-R1,R4,FP,SP"    "R2,R4,FP,SP" "R0,R2,R4,FP,SP" "R1-R2,R4,FP,SP" "R0-R2,R4,FP,SP" 
+                         "R3-R4,FP,SP" "R0,R3-R4,FP,SP" "R1,R3-R4,FP,SP" "R0-R1,R3-R4,FP,SP" "R2-R4,FP,SP" "R0,R2-R4,FP,SP" "R1-R4,FP,SP" "R0-R4,FP,SP" 
+
+                         "R5,FP,SP"    "R0,R5,FP,SP"    "R1,R5,FP,SP"    "R0-R1,R5,FP,SP"    "R2,R5,FP,SP"    "R0,R2,R5,FP,SP"    "R1-R2,R5,FP,SP"    "R0-R2,R5,FP,SP"
+                         "R3,R5,FP,SP" "R0,R3,R5,FP,SP" "R1,R3,R5,FP,SP" "R0-R1,R3,R5,FP,SP" "R2-R3,R5,FP,SP" "R0,R2-R3,R5,FP,SP" "R1-R3,R5,FP,SP"    "R0-R3,R5,FP,SP" 
+                         "R4-R5,FP,SP" "R0,R4-R5,FP,SP" "R1,R4-R5,FP,SP" "R0-R1,R4-R5,FP,SP" "R2,R4-R5,FP,SP" "R0,R2,R4-R5,FP,SP" "R1-R2,R4-R5,FP,SP" "R0-R2,R4-R5,FP,SP" 
+                         "R3-R5,FP,SP" "R0,R3-R5,FP,SP" "R1,R3-R5,FP,SP" "R0-R1,R3-R5,FP,SP" "R2-R5,FP,SP"    "R0,R2-R5,FP,SP"    "R1-R5,FP,SP"       "R0-R5,FP,SP" 
+];
+
+#@define T_FLAG       "T"
+#@define T_MASK       "0x80"
+#@define T_SHIFT      "15"
+#@define IMASK        "IMASK"
+#@define IMASK_MASK   "0x30"
+#@define IMASK_SHIFT  "8"
+#@define N_FLAG       "N"
+#@define N_MASK       "8"
+#@define N_SHIFT      "3"
+#@define Z_FLAG       "Z"
+#@define Z_MASK       "4"
+#@define Z_SHIFT      "2"
+#@define V_FLAG       "V"
+#@define V_MASK       "2"
+#@define V_SHIFT      "1"
+#@define C_FLAG       "C"
+#@define C_MASK       "1"
+#@define C_SHIFT      "0"
+
+#
+# SR pack and unpack support
+#macro genSRregister() {
+#	SR = 	
+#    (zext(T)     << $(T_SHIFT))     |
+#    (zext(IMASK) << $(IMASK_SHIFT)) |
+#    (zext(N)     << $(N_SHIFT))     |
+#    (zext(Z)     << $(Z_SHIFT))     |
+#    (zext(V)     << $(V_SHIFT))     |
+#    (zext(C)     << $(C_SHIFT));
+#}
+
+#macro splitSRregister() {
+#
+#	splitTemp:3  = (SR & $(T_MASK))     >> $(T_SHIFT);
+#	T            = splitTemp:1;
+#
+#	splitTemp    = (SR & $(IMASK_MASK)) >> $(IMASK_SHIFT);
+#	IMASK        = splitTemp:1;
+#
+#	splitTemp    = (SR & $(N_MASK))     >> $(N_SHIFT);
+#	N            = splitTemp:1;
+#
+#	splitTemp    = (SR & $(Z_MASK))     >> $(Z_SHIFT);
+#	Z            = splitTemp:1;
+#
+#	splitTemp    = (SR & $(V_MASK))     >> $(V_SHIFT);
+#	V            = splitTemp:1;
+#
+#	splitTemp    = (SR & $(C_MASK))     >> $(C_SHIFT);
+#	C            = splitTemp:1;
+#}
+
+macro SpreadFlags()
+{
+	$(CF) = SR[0,1];
+	$(VF) = SR[1,1];
+	$(ZF) = SR[2,1];
+	$(NF) = SR[3,1];
+}
+
+macro CollectFlags()
+{
+	SR[0,1] = $(CF);
+	SR[1,1] = $(VF);
+	SR[2,1] = $(ZF);
+	SR[3,1] = $(NF);
+}
+
+macro PUSH(val)
+{
+	SP24 = SP24 - 2;
+	*:2 SP24 = val;
+}
+
+macro POP(reg)
+{
+	reg = *:2 SP24;
+	SP24 = SP24 + 2;
+}
+
+macro subflags(op1, op2)
+{
+	result = op1 - op2;
+	$(CF) = op1 < op2;
+	$(VF) = (op1 s> op2) == (result s< 0);
+	$(ZF) = result == 0;
+	$(NF) = result s< 0;
+}
+
+macro subxflags(op1, op2)
+{
+	result = op1 - op2 - zext($(CF));
+	# CF: op2 can be (op2 + CF)
+	# VF: op1 can be (op1 - CF)
+	#cf16:2 = zext($(CF));
+	$(VF) = ((op1 - zext($(CF))) s> op2) == (result s< 0);
+	$(CF) = op1 < (op2 + zext($(CF)));
+	$(ZF) = result == 0;
+	$(NF) = result s< 0;
+}
+
+macro addflags(op1, op2)
+{
+	result = op1 + op2;
+	$(CF) = carry(op1, op2);
+	$(VF) = scarry(op1, op2);
+	$(ZF) = result == 0;
+	$(NF) = result s< 0;
+}
+
+macro CheckDivide(divisor)
+{
+	# Let's ignore all edge cases on divisions for now, because the point of
+	# a division is to divide, and all this seems to confuse the decompiler.
+
+	#if (divisor == 0) goto <Ok>;
+	#$(NF) = 0;
+	#$(VF) = 0;
+	#$(VF) = 0;
+	#$(ZF) = 1;
+	#addr:4 = inst_next;
+	#PUSH(addr[0,16]);
+	#PUSH(addr[16,16]);
+	#PUSH(SR[0,16]);
+	#goto inst_next;
+
+	# # I don't know if exceptions should be encoded in the PCode, but I expect it'll make the decompilation messy, so probably not.
+	# #vectorAddress:3 = *[ram]:3 0xD:3; # DIVXU is at 0xC is maximum mode, but offset by 1 to account for the padding up to 32-bit pointers in memory
+	# #call [vectorAddress];
+
+	#<Ok>
+}
+
+macro CheckOverflow8(quotient)
+{
+	# Ignoring edge cases for simplicity.
+	#if (quotient < 0x100) goto <NoOverflow>;
+	#$(VF) = 1;
+	#$(CF) = 0;
+	#$(NF) = 0;
+	#$(ZF) = 0;
+	#goto inst_next;
+	#<NoOverflow>
+}
+
+macro CheckOverflow16(quotient)
+{
+	# Ignoring edge cases for simplicity
+	#if (quotient < 0x10000) goto <NoOverflow>;
+	#$(VF) = 1;
+	#$(CF) = 0;
+	#$(NF) = 0;
+	#$(ZF) = 0;
+	#goto inst_next;
+	#<NoOverflow>
+}
+
+macro stdflags(val)
+{
+	$(NF) = val s< 0;
+	$(ZF) = val == 0;
+	$(VF) = 0;
+}
+
+macro bankify(addr, reg) {
+	dp24:3 = zext(DP);
+	ep24:3 = zext(EP);
+	tp24:3 = zext(TP);
+	add24:3 = zext(addr);
+	add24 = (((zext((reg & 4) == 0) * dp24) | (zext((reg & 6) == 4) * ep24) | (zext((reg & 6) == 6) * tp24)) << 16) | add24;
+	addr = add24;
+}
+
+macro bankify_dp(addr) {
+	dp32:3 = zext(DP);
+	add32:3 = zext(addr);
+	add32 = (dp32 << 16) | add32;
+	addr = add32;
+}
+
+#macro SetShortAbs8(addr, val) {
+#	ptr:3 = zext(addr) | zext(BR) << 8;
+#	*:1 ptr = val;
+#}
+
+macro SetShortAbs16(addr, val) {
+	ptr:3 = zext(addr) | zext(BR) << 8;
+	*:2 ptr = val;
+}
+
+#macro setContext(reg, val) {
+#	mask:8 = ~(0xff << ((&reg - 2) * 8));
+#	contextReg = (contextReg & mask) | (zext(val) << ((&reg - 2) * 8));
+#}
+
+cc: "ra" is cond=0 { export 1:1; }
+cc: "rn" is cond=1 { export 0:1; }
+cc: "hi" is cond=2 { tmp:1 = !($(CF) | $(ZF)); export tmp; }
+cc: "ls" is cond=3 { tmp:1 =  $(CF) | $(ZF); export tmp; }
+cc: "hs" is cond=4 { tmp:1 = !$(CF); export tmp; }
+cc: "lo" is cond=5 { tmp:1 =  $(CF); export tmp; }
+cc: "ne" is cond=6 { tmp:1 = !$(ZF); export tmp; }
+cc: "eq" is cond=7 { tmp:1 =  $(ZF); export tmp; }
+cc: "vc" is cond=8 { tmp:1 = !$(VF); export tmp; }
+cc: "vs" is cond=9 { tmp:1 =  $(VF); export tmp; }
+cc: "pl" is cond=10{ tmp:1 = !$(NF); export tmp; }
+cc: "mi" is cond=11{ tmp:1 =  $(NF); export tmp; }
+cc: "ge" is cond=12{ tmp:1 = $(NF) == $(VF); export tmp; } # N ^ Z == 0
+cc: "lt" is cond=13{ tmp:1 = $(NF) != $(VF); export tmp; } # N ^ Z == 1
+cc: "gt" is cond=14{ tmp:1 = !($(ZF) | ($(NF) ^ $(VF))); export tmp; }
+cc: "le" is cond=15{ tmp:1 =  ($(ZF) | ($(NF) ^ $(VF))); export tmp; }
+
+i8:  "#"^imm8^":8"                      is imm8  { export *[const]:1 imm8; }
+i16: "#"^imm16^":16"                    is imm16 { export *[const]:2 imm16; }
+s8:  "#"^disp8^":8"                     is disp8  { export *[const]:1 disp8; }
+s16: "#"^disp16^":16"                   is disp16 { export *[const]:2 disp16; }
+
+Rs24: "R0" is Rs = 0 { reg:1 = &R0 + 1; export *[register]:3 reg; }
+Rs24: "R2" is Rs = 2 { reg:1 = &R2 + 1; export *[register]:3 reg; }
+Rs24: "R4" is Rs = 4 { reg:1 = &R4 + 1; export *[register]:3 reg; }
+Rs24: "FP" is Rs = 6 { reg:1 = &FP + 1; export *[register]:3 reg; }
+Rs32: "R0" is Rs = 0 { value:4 = zext(R0 << 16) | zext(R1); export value; }
+Rs32: "R2" is Rs = 2 { value:4 = zext(R2 << 16) | zext(R3); export value; }
+Rs32: "R4" is Rs = 4 { value:4 = zext(R4 << 16) | zext(R5); export value; }
+Rs32: "FP" is Rs = 6 { value:4 = zext(FP << 16) | zext(SP); export value; }
+Rn32: "R0" is Rn = 0 { value:4 = zext(R0 << 16) | zext(R1); export value; }
+Rn32: "R2" is Rn = 2 { value:4 = zext(R2 << 16) | zext(R3); export value; }
+Rn32: "R4" is Rn = 4 { value:4 = zext(R4 << 16) | zext(R5); export value; }
+Rn32: "FP" is Rn = 6 { value:4 = zext(FP << 16) | zext(SP); export value; }
+
+addr8_br: addr8 is addr8 {
+	local addr:3 = (zext(BR) << 8) | addr8;
+	export addr;
+}
+
+addr16_dp:        addr16             is addr16 { local addr:3 = (zext(DP) << 16)| (addr16);  export addr; }
+
+disp8_banked:     disp8              is disp8  & targetBase=0 { local addrLo:2 = (R0 + disp8); local addr:3 = (zext(DP) << 16) | zext(addrLo);  export addr; }
+disp8_banked:     disp8              is disp8  & targetBase=1 { local addrLo:2 = (R1 + disp8); local addr:3 = (zext(DP) << 16) | zext(addrLo);  export addr; }
+disp8_banked:     disp8              is disp8  & targetBase=2 { local addrLo:2 = (R2 + disp8); local addr:3 = (zext(DP) << 16) | zext(addrLo);  export addr; }
+disp8_banked:     disp8              is disp8  & targetBase=3 { local addrLo:2 = (R3 + disp8); local addr:3 = (zext(DP) << 16) | zext(addrLo);  export addr; }
+disp8_banked:     disp8              is disp8  & targetBase=4 { local addrLo:2 = (R4 + disp8); local addr:3 = (zext(EP) << 16) | zext(addrLo);  export addr; }
+disp8_banked:     disp8              is disp8  & targetBase=5 { local addrLo:2 = (R5 + disp8); local addr:3 = (zext(EP) << 16) | zext(addrLo);  export addr; }
+disp8_banked:     disp8              is disp8  & targetBase=6 { local addrLo:2 = (FP + disp8); local addr:3 = (zext(TP) << 16) | zext(addrLo);  export addr; }
+disp8_banked:     disp8              is disp8  & targetBase=7 { local addrLo:2 = (SP + disp8); local addr:3 = (zext(TP) << 16) | zext(addrLo);  export addr; }
+
+disp16_banked:    disp16             is disp16 & targetBase=0 { local addrLo:2 = (R0 + disp16); local addr:3 = (zext(DP) << 16) | zext(addrLo);  export addr; }
+disp16_banked:    disp16             is disp16 & targetBase=1 { local addrLo:2 = (R1 + disp16); local addr:3 = (zext(DP) << 16) | zext(addrLo);  export addr; }
+disp16_banked:    disp16             is disp16 & targetBase=2 { local addrLo:2 = (R2 + disp16); local addr:3 = (zext(DP) << 16) | zext(addrLo);  export addr; }
+disp16_banked:    disp16             is disp16 & targetBase=3 { local addrLo:2 = (R3 + disp16); local addr:3 = (zext(DP) << 16) | zext(addrLo);  export addr; }
+disp16_banked:    disp16             is disp16 & targetBase=4 { local addrLo:2 = (R4 + disp16); local addr:3 = (zext(EP) << 16) | zext(addrLo);  export addr; }
+disp16_banked:    disp16             is disp16 & targetBase=5 { local addrLo:2 = (R5 + disp16); local addr:3 = (zext(EP) << 16) | zext(addrLo);  export addr; }
+disp16_banked:    disp16             is disp16 & targetBase=6 { local addrLo:2 = (FP + disp16); local addr:3 = (zext(TP) << 16) | zext(addrLo);  export addr; }
+disp16_banked:    disp16             is disp16 & targetBase=7 { local addrLo:2 = (SP + disp16); local addr:3 = (zext(TP) << 16) | zext(addrLo);  export addr; }
+
+#Rn_banked:        Rn                 is Rn { local addr:3 = zext(Rn); bankify(addr, (&:1 Rn) >> 1); export addr; }
+Rn_banked:       "R0"              is Rn=0 { local addr:3 = (zext(DP) << 16) | zext(R0); export addr; }
+Rn_banked:       "R1"              is Rn=1 { local addr:3 = (zext(DP) << 16) | zext(R1); export addr; }
+Rn_banked:       "R2"              is Rn=2 { local addr:3 = (zext(DP) << 16) | zext(R2); export addr; }
+Rn_banked:       "R3"              is Rn=3 { local addr:3 = (zext(DP) << 16) | zext(R3); export addr; }
+Rn_banked:       "R4"              is Rn=4 { local addr:3 = (zext(EP) << 16) | zext(R4); export addr; }
+Rn_banked:       "R5"              is Rn=5 { local addr:3 = (zext(EP) << 16) | zext(R5); export addr; }
+Rn_banked:       "FP"              is Rn=6 { local addr:3 = FP24                       ; export addr; }
+Rn_banked:       "SP"              is Rn=7 { local addr:3 = SP24                       ; export addr; }
+
+Rs_banked:       "R0"              is Rs=0 { local addr:3 = (zext(DP) << 16) | zext(R0); export addr; }
+Rs_banked:       "R1"              is Rs=1 { local addr:3 = (zext(DP) << 16) | zext(R1); export addr; }
+Rs_banked:       "R2"              is Rs=2 { local addr:3 = (zext(DP) << 16) | zext(R2); export addr; }
+Rs_banked:       "R3"              is Rs=3 { local addr:3 = (zext(DP) << 16) | zext(R3); export addr; }
+Rs_banked:       "R4"              is Rs=4 { local addr:3 = (zext(EP) << 16) | zext(R4); export addr; }
+Rs_banked:       "R5"              is Rs=5 { local addr:3 = (zext(EP) << 16) | zext(R5); export addr; }
+Rs_banked:       "FP"              is Rs=6 { local addr:3 = FP24                       ; export addr; }
+Rs_banked:       "SP"              is Rs=7 { local addr:3 = SP24                       ; export addr; }
+
+r0_push: "R0 " is reglist0=1 { SP24 = SP24 - 2; *:2 SP24 = R0; }
+r1_push: "R1 " is reglist1=1 { SP24 = SP24 - 2; *:2 SP24 = R1; }
+r2_push: "R2 " is reglist2=1 { SP24 = SP24 - 2; *:2 SP24 = R2; }
+r3_push: "R3 " is reglist3=1 { SP24 = SP24 - 2; *:2 SP24 = R3; }
+r4_push: "R4 " is reglist4=1 { SP24 = SP24 - 2; *:2 SP24 = R4; }
+r5_push: "R5 " is reglist5=1 { SP24 = SP24 - 2; *:2 SP24 = R5; }
+fp_push: "FP " is reglist6=1 { SP24 = SP24 - 2; *:2 SP24 = FP; }
+sp_push: "SP " is reglist7=1 { SP24 = SP24 - 2; *:2 SP24 = SP; }
+r0_push:       is reglist0=0 { }
+r1_push:       is reglist1=0 { }
+r2_push:       is reglist2=0 { }
+r3_push:       is reglist3=0 { }
+r4_push:       is reglist4=0 { }
+r5_push:       is reglist5=0 { }
+fp_push:       is reglist6=0 { }
+sp_push:       is reglist7=0 { }
+sp_pop:  "SP " is reglist7=1 { SP = *:2 SP24; SP24 = SP24 + 2; }
+fp_pop:  "FP " is reglist6=1 { FP = *:2 SP24; SP24 = SP24 + 2; }
+r5_pop:  "R5 " is reglist5=1 { R5 = *:2 SP24; SP24 = SP24 + 2; }
+r4_pop:  "R4 " is reglist4=1 { R4 = *:2 SP24; SP24 = SP24 + 2; }
+r3_pop:  "R3 " is reglist3=1 { R3 = *:2 SP24; SP24 = SP24 + 2; }
+r2_pop:  "R2 " is reglist2=1 { R2 = *:2 SP24; SP24 = SP24 + 2; }
+r1_pop:  "R1 " is reglist1=1 { R1 = *:2 SP24; SP24 = SP24 + 2; }
+r0_pop:  "R0 " is reglist0=1 { R0 = *:2 SP24; SP24 = SP24 + 2; }
+r0_pop:        is reglist0=0 { }
+r1_pop:        is reglist1=0 { }
+r2_pop:        is reglist2=0 { }
+r3_pop:        is reglist3=0 { }
+r4_pop:        is reglist4=0 { }
+r5_pop:        is reglist5=0 { }
+fp_pop:        is reglist6=0 { }
+sp_pop:        is reglist7=0 { }
+
+eab_direct:       Rn                        is Rn & mode = 10 & sz = 0            { export Rn; } # exports whole 16-bit register; make sure to always use :1 or [0,8] in tables that reference this
+eaw_direct:       Rn                        is Rn & mode = 10 & sz = 1            { export Rn; }
+eab_indirect:     "@"^Rn_banked             is Rn_banked & mode = 13 & sz = 0     { export *:1 Rn_banked; }
+eaw_indirect:     "@"^Rn_banked             is Rn_banked & mode = 13 & sz = 1     { export *:2 Rn_banked; }
+eab_disp8:        "@("^disp8^":8,"^Rn_banked^")"   is Rn_banked & mode = 14 & sz = 0; disp8     { tmp = (Rn_banked + disp8);  export *:1 tmp; }
+eaw_disp8:        "@("^disp8^":8,"^Rn_banked^")"   is Rn_banked & mode = 14 & sz = 1; disp8     { tmp = (Rn_banked + disp8);  export *:2 tmp; }
+eab_disp16:       "@("^disp16^":16,"^Rn_banked^")" is Rn_banked & mode = 15 & sz = 0; disp16    { tmp = (Rn_banked + disp16); export *:1 tmp; }
+eaw_disp16:       "@("^disp16^":16,"^Rn_banked^")" is Rn_banked & mode = 15 & sz = 1; disp16    { tmp = (Rn_banked + disp16); export *:2 tmp; }
+eab_predec:       "@-SP"                    is Rn=7 & mode = 11 & sz = 0                        { SP24 = SP24 - 2; export *:1 SP24; }
+eaw_predec:       "@-SP"                    is Rn=7 & mode = 11 & sz = 1                        { SP24 = SP24 - 2; export *:2 SP24; }
+eab_postinc:      "@SP+"                    is Rn=7 & mode = 12 & sz = 0                        { tmp = SP24; SP24 = SP24 + 2; export *:1 tmp; }
+eaw_postinc:      "@SP+"                    is Rn=7 & mode = 12 & sz = 1                        { tmp = SP24; SP24 = SP24 + 2; export *:2 tmp; }
+eab_predec:       "@-"^Rn_banked            is Rn_banked & mode = 11 & sz = 0                   { Rn_banked = Rn_banked - 1; export *:1 Rn_banked; }
+eaw_predec:       "@-"^Rn_banked            is Rn_banked & mode = 11 & sz = 1                   { Rn_banked = Rn_banked - 2; export *:2 Rn_banked; }
+eab_postinc:      "@"^Rn_banked^"+"         is Rn_banked & mode = 12 & sz = 0                   { tmp = Rn_banked; Rn_banked = Rn_banked + 1; export *:1 tmp; }
+eaw_postinc:      "@"^Rn_banked^"+"         is Rn_banked & mode = 12 & sz = 1                   { tmp = Rn_banked; Rn_banked = Rn_banked + 1; export *:2 tmp; }
+#eab_abs8:         "@"^addr8^":8"            is Rn = 5 & mode = 0 & sz = 0; addr8  { export *:1 addr8; }
+#eaw_abs8:         "@"^addr8^":8"            is Rn = 5 & mode = 0 & sz = 1; addr8  { export *:2 addr8; }
+eab_abs8_br:      "@"^addr8_br^":8"         is Rn = 5 & mode = 0 & sz = 0; addr8_br      { export *:1 addr8_br; }
+eaw_abs8_br:      "@"^addr8_br^":8"         is Rn = 5 & mode = 0 & sz = 1; addr8_br      { export *:2 addr8_br; }
+eab_abs16:        "@"^addr16_dp^":16"   is Rn = 5 & mode = 1 & sz = 0; addr16_dp { export *:1 addr16_dp; }
+#eab_abs16: "@"^addr16_dp^":16"   is Rn = 5 & mode = 1 & sz = 0; addr16_dp { export *:1 addr16_dp; }
+eaw_abs16:        "@"^addr16_dp^":16"   is Rn = 5 & mode = 1 & sz = 1; addr16_dp { export *:2 addr16_dp; }
+#eaw_abs16: "@"^addr16_dp^":16"   is Rn = 5 & mode = 1 & sz = 1; addr16_dp { export *:2 addr16_dp; }
+eab_imm8:         i8                        is Rn=4 & sz=0 & mode=0; i8           { export *[const]:1 i8; }
+eaw_imm16:        i16                       is Rn=4 & sz=1 & mode=0; i16          { export *[const]:2 i16; }
+
+reloffs8:  reloc is disp8        [ reloc=(inst_next & 0xFF0000) | ((inst_next+disp8) & 0xFFFF);  ] { export * reloc; }
+reloffs16: reloc is disp16       [ reloc=(inst_next & 0xFF0000) | ((inst_next+disp16) & 0xFFFF); ] { export * reloc; }
+
+
+# MOV:G <EAs>,Rd           Move data from source to destination, general format
+#       N: Rd s< 0
+#       Z: Rd == 0
+#       V: 0
+:mov:"g.b"    eab_direct,Rd             is eab_direct;          opcode=16 & Rd                     { Rd[0,8] = eab_direct[0,8]; stdflags(Rd[0,8]); }
+:mov:"g.b"    eab_indirect,Rd           is eab_indirect;        opcode=16 & Rd                     { Rd[0,8] = eab_indirect[0,8]; stdflags(Rd[0,8]); }
+:mov:"g.b"    eab_disp8,Rd              is eab_disp8;           opcode=16 & Rd                     { Rd[0,8] = eab_disp8[0,8]; stdflags(Rd[0,8]); }
+:mov:"g.b"    eab_disp16,Rd             is eab_disp16;          opcode=16 & Rd                     { Rd[0,8] = eab_disp16[0,8]; stdflags(Rd[0,8]); }
+:mov:"g.b"    eab_predec,Rd             is eab_predec;          opcode=16 & Rd                     { Rd[0,8] = eab_predec[0,8]; stdflags(Rd[0,8]); }
+:mov:"g.b"    eab_postinc,Rd            is eab_postinc;         opcode=16 & Rd                     { Rd[0,8] = eab_postinc[0,8]; stdflags(Rd[0,8]); }
+:mov:"g.b"    eab_abs8_br,Rd            is eab_abs8_br;         opcode=16 & Rd                     { Rd[0,8] = eab_abs8_br[0,8]; stdflags(Rd[0,8]); }
+:mov:"g.b"    eab_abs16,Rd              is eab_abs16;           opcode=16 & Rd                     { Rd[0,8] = eab_abs16; stdflags(Rd[0,8]); }
+:mov:"g.b"    eab_imm8,Rd               is eab_imm8;            opcode=16 & Rd                     { Rd[0,8] = eab_imm8[0,8]; stdflags(Rd[0,8]); }
+:mov:"g.w"    eaw_direct,Rd             is eaw_direct;          opcode=16 & Rd                     { Rd      = eaw_direct; stdflags(Rd); }
+:mov:"g.w"    eaw_indirect,Rd           is eaw_indirect;        opcode=16 & Rd                     { Rd      = eaw_indirect; stdflags(Rd); }
+:mov:"g.w"    eaw_disp8,Rd              is eaw_disp8;           opcode=16 & Rd                     { Rd      = eaw_disp8; stdflags(Rd); }
+:mov:"g.w"    eaw_disp16,Rd             is eaw_disp16;          opcode=16 & Rd                     { Rd      = eaw_disp16; stdflags(Rd); }
+:mov:"g.w"    eaw_predec,Rd             is eaw_predec;          opcode=16 & Rd                     { Rd      = eaw_predec; stdflags(Rd); }
+:mov:"g.w"    eaw_postinc,Rd            is eaw_postinc;         opcode=16 & Rd                     { Rd      = eaw_postinc; stdflags(Rd); }
+:mov:"g.w"    eaw_abs8_br,Rd            is eaw_abs8_br;         opcode=16 & Rd                     { Rd      = eaw_abs8_br; stdflags(Rd); }
+:mov:"g.w"    eaw_abs16,Rd              is eaw_abs16;           opcode=16 & Rd                     { Rd      = eaw_abs16; stdflags(Rd); }
+:mov:"g.w"    eaw_imm16,Rd              is eaw_imm16;           opcode=16 & Rd                     { Rd      = eaw_imm16; stdflags(Rd); }
+
+# MOV:G Rs,<EAd>           Move data from source to destination, general format
+#       N: Rs s< 0
+#       Z: Rs == 0
+#       V: 0
+:mov:"g.b"    Rs,eab_indirect           is eab_indirect;        opcode=18 & Rs                     { eab_indirect[0,8] = Rs[0,8]; stdflags(Rs[0,8]); }
+:mov:"g.b"    Rs,eab_disp8              is eab_disp8;           opcode=18 & Rs                     { eab_disp8[0,8] = Rs[0,8];    stdflags(Rs[0,8]); }
+:mov:"g.b"    Rs,eab_disp16             is eab_disp16;          opcode=18 & Rs                     { eab_disp16[0,8] = Rs[0,8];   stdflags(Rs[0,8]); }
+:mov:"g.b"    Rs,eab_predec             is eab_predec;          opcode=18 & Rs                     { eab_predec[0,8] = Rs[0,8];   stdflags(Rs[0,8]); }
+:mov:"g.b"    Rs,eab_postinc            is eab_postinc;         opcode=18 & Rs                     { eab_postinc[0,8] = Rs[0,8];  stdflags(Rs[0,8]); }
+:mov:"g.b"    Rs,eab_abs8_br            is eab_abs8_br;         opcode=18 & Rs                     { eab_abs8_br[0,8] = Rs[0,8];     stdflags(Rs[0,8]); }
+:mov:"g.b"    Rs,eab_abs16       is eab_abs16;    opcode=18 & Rs [targetBase = Rs;]  { eab_abs16 = Rs[0,8];  stdflags(Rs[0,8]); }
+:mov:"g.b"    Rs,eab_imm8               is eab_imm8;            opcode=18 & Rs                     { eab_imm8[0,8] = Rs[0,8];     stdflags(Rs[0,8]); }
+:mov:"g.w"    Rs,eaw_indirect           is eaw_indirect;        opcode=18 & Rs                     { eaw_indirect = Rs;           stdflags(Rs); }
+:mov:"g.w"    Rs,eaw_disp8              is eaw_disp8;           opcode=18 & Rs                     { eaw_disp8 = Rs;              stdflags(Rs); }
+:mov:"g.w"    Rs,eaw_disp16             is eaw_disp16;          opcode=18 & Rs                     { eaw_disp16 = Rs;             stdflags(Rs); }
+:mov:"g.w"    Rs,eaw_predec             is eaw_predec;          opcode=18 & Rs                     { eaw_predec = Rs;             stdflags(Rs); }
+:mov:"g.w"    Rs,eaw_postinc            is eaw_postinc;         opcode=18 & Rs                     { eaw_postinc = Rs;            stdflags(Rs); }
+:mov:"g.w"    Rs,eaw_abs8_br               is eaw_abs8_br;            opcode=18 & Rs                     { eaw_abs8_br = Rs;               stdflags(Rs); }
+:mov:"g.w"    Rs,eaw_abs16       is eaw_abs16;    opcode=18 & Rs [targetBase = Rs;]  { eaw_abs16 = Rs     ;  stdflags(Rs); }
+:mov:"g.w"    Rs,eaw_imm16              is eaw_imm16;           opcode=18 & Rs                     { eaw_imm16 = Rs;              stdflags(Rs); }
+
+# MOV:G #xx,<EAd>          Move data from source to destination, general format
+#       N: xx s< 0
+#       Z: xx == 0
+#       V: 0
+# If the immediate data length is 8 bits but word size is specified in the <EA> field,
+# the sign bit of the immediate data is extended and 16 bits of data are transferred.
+:mov:"g.b"    i8,eab_indirect           is eab_indirect    ; opcode_special=6; i8                  { eab_indirect = i8;            stdflags(i8);  }
+:mov:"g.b"    i8,eab_disp8              is eab_disp8       ; opcode_special=6; i8                  { eab_disp8    = i8;            stdflags(i8);  }
+:mov:"g.b"    i8,eab_disp16             is eab_disp16      ; opcode_special=6; i8                  { eab_disp16   = i8;            stdflags(i8);  }
+:mov:"g.b"    i8,eab_predec             is eab_predec      ; opcode_special=6; i8                  { eab_predec   = i8;            stdflags(i8);  }
+:mov:"g.b"    i8,eab_postinc            is eab_postinc     ; opcode_special=6; i8                  { eab_postinc  = i8;            stdflags(i8);  }
+:mov:"g.b"    i8,eab_abs8_br            is eab_abs8_br     ; opcode_special=6; i8                  { eab_abs8_br  = i8;            stdflags(i8);  }
+:mov:"g.b"    i8,eab_abs16              is eab_abs16;        opcode_special=6; i8                  { eab_abs16 = i8;        stdflags(i8);  }
+:mov:"g.w"    i8,eaw_indirect           is eaw_indirect    ; opcode_special=6; i8                  { eaw_indirect = sext(i8);      stdflags(i8);  }
+:mov:"g.w"    i8,eaw_disp8              is eaw_disp8       ; opcode_special=6; i8                  { eaw_disp8    = sext(i8);      stdflags(i8);  }
+:mov:"g.w"    i8,eaw_disp16             is eaw_disp16      ; opcode_special=6; i8                  { eaw_disp16   = sext(i8);      stdflags(i8);  }
+:mov:"g.w"    i8,eaw_predec             is eaw_predec      ; opcode_special=6; i8                  { eaw_predec   = sext(i8);      stdflags(i8);  }
+:mov:"g.w"    i8,eaw_postinc            is eaw_postinc     ; opcode_special=6; i8                  { eaw_postinc  = sext(i8);      stdflags(i8);  }
+:mov:"g.w"    i8,eaw_abs8_br            is eaw_abs8_br     ; opcode_special=6; i8                  { eaw_abs8_br  = sext(i8);      stdflags(i8);  }
+:mov:"g.w"    i8,eaw_abs16              is eaw_abs16;        opcode_special=6; i8                  { eaw_abs16 = sext(i8);  stdflags(i8);  }
+:mov:"g.w"    i16,eaw_indirect          is eaw_indirect    ; opcode_special=7; i16                 { eaw_indirect = i16;           stdflags(i16); }
+:mov:"g.w"    i16,eaw_disp8             is eaw_disp8       ; opcode_special=7; i16                 { eaw_disp8    = i16;           stdflags(i16); }
+:mov:"g.w"    i16,eaw_disp16            is eaw_disp16      ; opcode_special=7; i16                 { eaw_disp16   = i16;           stdflags(i16); }
+:mov:"g.w"    i16,eaw_predec            is eaw_predec      ; opcode_special=7; i16                 { eaw_predec   = i16;           stdflags(i16); }
+:mov:"g.w"    i16,eaw_postinc           is eaw_postinc     ; opcode_special=7; i16                 { eaw_postinc  = i16;           stdflags(i16); }
+:mov:"g.w"    i16,eaw_abs8_br           is eaw_abs8_br     ; opcode_special=7; i16                 { eaw_abs8_br  = i16;           stdflags(i16); }
+:mov:"g.w"    i16,eaw_abs16             is eaw_abs16;        opcode_special=7; i16                 { eaw_abs16 = i16;       stdflags(i16); }
+
+# ADD:G <EAs>,Rd           Add, general format
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs
+#       C: unsigned overflow: result u< Rd_original
+:add:"g.b"    eab_direct,Rd             is eab_direct;       opcode=4 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_direct[0,8]  ; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.b"    eab_indirect,Rd           is eab_indirect;     opcode=4 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_indirect[0,8]; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.b"    eab_disp8,Rd              is eab_disp8;        opcode=4 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_disp8[0,8]   ; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.b"    eab_disp16,Rd             is eab_disp16;       opcode=4 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_disp16[0,8]  ; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.b"    eab_predec,Rd             is eab_predec;       opcode=4 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_predec[0,8]  ; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.b"    eab_postinc,Rd            is eab_postinc;      opcode=4 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_postinc[0,8] ; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.b"    eab_abs8_br,Rd            is eab_abs8_br;      opcode=4 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_abs8_br[0,8] ; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.b"    eab_imm8,Rd               is eab_imm8;         opcode=4 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_imm8[0,8]    ; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.w"    eaw_direct,Rd             is eaw_direct;       opcode=4 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_direct       ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+:add:"g.w"    eaw_indirect,Rd           is eaw_indirect;     opcode=4 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_indirect     ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+:add:"g.w"    eaw_disp8,Rd              is eaw_disp8;        opcode=4 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_disp8        ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+:add:"g.w"    eaw_disp16,Rd             is eaw_disp16;       opcode=4 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_disp16       ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+:add:"g.w"    eaw_predec,Rd             is eaw_predec;       opcode=4 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_predec       ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+:add:"g.w"    eaw_postinc,Rd            is eaw_postinc;      opcode=4 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_postinc      ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+:add:"g.w"    eaw_abs8_br,Rd            is eaw_abs8_br;      opcode=4 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_abs8_br      ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+:add:"g.w"    eaw_imm16,Rd              is eaw_imm16;        opcode=4 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_imm16        ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+:add:"g.b"    eab_abs16,Rd       is eab_abs16; opcode=4 & Rd [targetBase = Rd; ] { op1:1 = Rd[0,8]; op2:1 = eab_abs16 ; out:1 = op1 + op2; Rd[0,8] = out; addflags(op1, op2); }
+:add:"g.w"    eaw_abs16,Rd       is eaw_abs16; opcode=4 & Rd [targetBase = Rd; ] { op1:2 = Rd     ; op2:2 = eaw_abs16 ; out:2 = op1 + op2; Rd      = out; addflags(op1, op2); }
+
+# SUB   <EAs>,Rd           Subtract binary
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs
+#       C: unsigned borrow: result u> Rd_original
+:sub.b        eab_direct,Rd             is eab_direct;       opcode=6 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_direct[0,8]  ; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.b        eab_indirect,Rd           is eab_indirect;     opcode=6 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_indirect[0,8]; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.b        eab_disp8,Rd              is eab_disp8;        opcode=6 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_disp8[0,8]   ; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.b        eab_disp16,Rd             is eab_disp16;       opcode=6 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_disp16[0,8]  ; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.b        eab_predec,Rd             is eab_predec;       opcode=6 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_predec[0,8]  ; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.b        eab_postinc,Rd            is eab_postinc;      opcode=6 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_postinc[0,8] ; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.b        eab_abs8_br,Rd            is eab_abs8_br;      opcode=6 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_abs8_br[0,8] ; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.b        eab_imm8,Rd               is eab_imm8;         opcode=6 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_imm8[0,8]    ; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.w        eaw_direct,Rd             is eaw_direct;       opcode=6 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_direct       ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+:sub.w        eaw_indirect,Rd           is eaw_indirect;     opcode=6 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_indirect     ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+:sub.w        eaw_disp8,Rd              is eaw_disp8;        opcode=6 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_disp8        ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+:sub.w        eaw_disp16,Rd             is eaw_disp16;       opcode=6 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_disp16       ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+:sub.w        eaw_predec,Rd             is eaw_predec;       opcode=6 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_predec       ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+:sub.w        eaw_postinc,Rd            is eaw_postinc;      opcode=6 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_postinc      ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+:sub.w        eaw_abs8_br,Rd            is eaw_abs8_br;      opcode=6 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_abs8_br      ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+:sub.w        eaw_imm16,Rd              is eaw_imm16;        opcode=6 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_imm16        ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+:sub.b        eab_abs16,Rd       is eab_abs16; opcode=6 & Rd [targetBase = Rd; ] { op1:1 = Rd[0,8]; op2:1 = eab_abs16 ; out:1 = op1 - op2; Rd[0,8] = out; subflags(op1, op2); }
+:sub.w        eaw_abs16,Rd       is eaw_abs16; opcode=6 & Rd [targetBase = Rd; ] { op1:2 = Rd     ; op2:2 = eaw_abs16 ; out:2 = op1 - op2; Rd      = out; subflags(op1, op2); }
+
+# SUBS  <EAs>,Rd           Subtract with sign extension
+#       no flags
+:subs.b       eab_direct,Rd             is eab_direct;       opcode=7 & Rd                     { Rd      = Rd      - sext(eab_direct[0,8]); }
+:subs.b       eab_indirect,Rd           is eab_indirect;     opcode=7 & Rd                     { Rd      = Rd      - sext(eab_indirect[0,8]); }
+:subs.b       eab_disp8,Rd              is eab_disp8;        opcode=7 & Rd                     { Rd      = Rd      - sext(eab_disp8[0,8]); }
+:subs.b       eab_disp16,Rd             is eab_disp16;       opcode=7 & Rd                     { Rd      = Rd      - sext(eab_disp16[0,8]); }
+:subs.b       eab_predec,Rd             is eab_predec;       opcode=7 & Rd                     { Rd      = Rd      - sext(eab_predec[0,8]); }
+:subs.b       eab_postinc,Rd            is eab_postinc;      opcode=7 & Rd                     { Rd      = Rd      - sext(eab_postinc[0,8]); }
+:subs.b       eab_abs8_br,Rd            is eab_abs8_br;      opcode=7 & Rd                     { Rd      = Rd      - sext(eab_abs8_br[0,8]); }
+:subs.b       eab_imm8,Rd               is eab_imm8;         opcode=7 & Rd                     { Rd      = Rd      - sext(eab_imm8[0,8]); }
+:subs.w       eaw_direct,Rd             is eaw_direct;       opcode=7 & Rd                     { Rd      = Rd      - eaw_direct; }
+:subs.w       eaw_indirect,Rd           is eaw_indirect;     opcode=7 & Rd                     { Rd      = Rd      - eaw_indirect; }
+:subs.w       eaw_disp8,Rd              is eaw_disp8;        opcode=7 & Rd                     { Rd      = Rd      - eaw_disp8; }
+:subs.w       eaw_disp16,Rd             is eaw_disp16;       opcode=7 & Rd                     { Rd      = Rd      - eaw_disp16; }
+:subs.w       eaw_predec,Rd             is eaw_predec;       opcode=7 & Rd                     { Rd      = Rd      - eaw_predec; }
+:subs.w       eaw_postinc,Rd            is eaw_postinc;      opcode=7 & Rd                     { Rd      = Rd      - eaw_postinc; }
+:subs.w       eaw_abs8_br,Rd            is eaw_abs8_br;      opcode=7 & Rd                     { Rd      = Rd      - eaw_abs8_br; }
+:subs.w       eaw_imm16,Rd              is eaw_imm16;        opcode=7 & Rd                     { Rd      = Rd      - eaw_imm16; }
+:subs.b       eab_abs16,Rd       is eab_abs16; opcode=7 & Rd [targetBase = Rd; ] { Rd      = Rd      - sext(eab_abs16); }
+:subs.w       eaw_abs16,Rd       is eaw_abs16; opcode=7 & Rd [targetBase = Rd; ] { Rd      = Rd      - eaw_abs16; }
+
+# SUBX  <EAs>,Rd           Subtract binary
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs
+#       C: unsigned borrow: result u> Rd_original
+:subx.b       eab_direct,Rd             is eab_direct;       opcode=22 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_direct[0,8]  ; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.b       eab_indirect,Rd           is eab_indirect;     opcode=22 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_indirect[0,8]; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.b       eab_disp8,Rd              is eab_disp8;        opcode=22 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_disp8[0,8]   ; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.b       eab_disp16,Rd             is eab_disp16;       opcode=22 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_disp16[0,8]  ; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.b       eab_predec,Rd             is eab_predec;       opcode=22 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_predec[0,8]  ; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.b       eab_postinc,Rd            is eab_postinc;      opcode=22 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_postinc[0,8] ; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.b       eab_abs8_br,Rd            is eab_abs8_br;      opcode=22 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_abs8_br[0,8] ; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.b       eab_imm8,Rd               is eab_imm8;         opcode=22 & Rd                     { op1:1 = Rd[0,8]; op2:1 = eab_imm8[0,8]    ; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.w       eaw_direct,Rd             is eaw_direct;       opcode=22 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_direct       ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+:subx.w       eaw_indirect,Rd           is eaw_indirect;     opcode=22 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_indirect     ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+:subx.w       eaw_disp8,Rd              is eaw_disp8;        opcode=22 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_disp8        ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+:subx.w       eaw_disp16,Rd             is eaw_disp16;       opcode=22 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_disp16       ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+:subx.w       eaw_predec,Rd             is eaw_predec;       opcode=22 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_predec       ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+:subx.w       eaw_postinc,Rd            is eaw_postinc;      opcode=22 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_postinc      ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+:subx.w       eaw_abs8_br,Rd            is eaw_abs8_br;      opcode=22 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_abs8_br      ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+:subx.w       eaw_imm16,Rd              is eaw_imm16;        opcode=22 & Rd                     { op1:2 = Rd     ; op2:2 = eaw_imm16        ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+:subx.b       eab_abs16,Rd       is eab_abs16; opcode=22 & Rd [targetBase = Rd; ] { op1:1 = Rd[0,8]; op2:1 = eab_abs16 ; out:1 = op1 - op2 -      $(CF) ; Rd[0,8] = out; subxflags  (op1, op2); }
+:subx.w       eaw_abs16,Rd       is eaw_abs16; opcode=22 & Rd [targetBase = Rd; ] { op1:2 = Rd     ; op2:2 = eaw_abs16 ; out:2 = op1 - op2 - zext($(CF)); Rd      = out; subxflags  (op1, op2); }
+
+# ADDS  <EAs>,Rd           Add with sign extension
+#       no flags
+:adds.b       eab_direct,Rd             is eab_direct;       opcode=5 & Rd                    { Rd      = Rd      + sext(eab_direct[0,8]); }
+:adds.b       eab_indirect,Rd           is eab_indirect;     opcode=5 & Rd                    { Rd      = Rd      + sext(eab_indirect[0,8]); }
+:adds.b       eab_disp8,Rd              is eab_disp8;        opcode=5 & Rd                    { Rd      = Rd      + sext(eab_disp8[0,8]); }
+:adds.b       eab_disp16,Rd             is eab_disp16;       opcode=5 & Rd                    { Rd      = Rd      + sext(eab_disp16[0,8]); }
+:adds.b       eab_predec,Rd             is eab_predec;       opcode=5 & Rd                    { Rd      = Rd      + sext(eab_predec[0,8]); }
+:adds.b       eab_postinc,Rd            is eab_postinc;      opcode=5 & Rd                    { Rd      = Rd      + sext(eab_postinc[0,8]); }
+:adds.b       eab_abs8_br,Rd            is eab_abs8_br;      opcode=5 & Rd                    { Rd      = Rd      + sext(eab_abs8_br[0,8]); }
+:adds.b       eab_imm8,Rd               is eab_imm8;         opcode=5 & Rd                    { Rd      = Rd      + sext(eab_imm8[0,8]); }
+:adds.w       eaw_direct,Rd             is eaw_direct;       opcode=5 & Rd                    { Rd      = Rd      + eaw_direct; }
+:adds.w       eaw_indirect,Rd           is eaw_indirect;     opcode=5 & Rd                    { Rd      = Rd      + eaw_indirect; }
+:adds.w       eaw_disp8,Rd              is eaw_disp8;        opcode=5 & Rd                    { Rd      = Rd      + eaw_disp8; }
+:adds.w       eaw_disp16,Rd             is eaw_disp16;       opcode=5 & Rd                    { Rd      = Rd      + eaw_disp16; }
+:adds.w       eaw_predec,Rd             is eaw_predec;       opcode=5 & Rd                    { Rd      = Rd      + eaw_predec; }
+:adds.w       eaw_postinc,Rd            is eaw_postinc;      opcode=5 & Rd                    { Rd      = Rd      + eaw_postinc; }
+:adds.w       eaw_abs8_br,Rd            is eaw_abs8_br;      opcode=5 & Rd                    { Rd      = Rd      + eaw_abs8_br; }
+:adds.w       eaw_imm16,Rd              is eaw_imm16;        opcode=5 & Rd                    { Rd      = Rd      + eaw_imm16; }
+:adds.b       eab_abs16,Rd       is eab_abs16; opcode=5 & Rd [targetBase = Rd; ] { Rd      = Rd      + sext(eab_abs16); }
+:adds.w       eaw_abs16,Rd       is eaw_abs16; opcode=5 & Rd [targetBase = Rd; ] { Rd      = Rd      + eaw_abs16; }
+
+# ADDX  <EAs>,Rd           Add with extended carry
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs
+#       C: unsigned overflow: result u< Rd_original
+# 8-bit values are sign-extended into 16-bit destination registers
+:addx.b       eab_direct,Rd             is eab_direct;       opcode=20 & Rd                    { Rd[0,8] = Rd[0,8] + eab_direct[0,8] + $(CF); }
+:addx.b       eab_indirect,Rd           is eab_indirect;     opcode=20 & Rd                    { Rd[0,8] = Rd[0,8] + eab_indirect[0,8] + $(CF); }
+:addx.b       eab_disp8,Rd              is eab_disp8;        opcode=20 & Rd                    { Rd[0,8] = Rd[0,8] + eab_disp8[0,8] + $(CF); }
+:addx.b       eab_disp16,Rd             is eab_disp16;       opcode=20 & Rd                    { Rd[0,8] = Rd[0,8] + eab_disp16[0,8] + $(CF); }
+:addx.b       eab_predec,Rd             is eab_predec;       opcode=20 & Rd                    { Rd[0,8] = Rd[0,8] + eab_predec[0,8] + $(CF); }
+:addx.b       eab_postinc,Rd            is eab_postinc;      opcode=20 & Rd                    { Rd[0,8] = Rd[0,8] + eab_postinc[0,8] + $(CF); }
+:addx.b       eab_abs8_br,Rd            is eab_abs8_br;      opcode=20 & Rd                    { Rd[0,8] = Rd[0,8] + eab_abs8_br[0,8] + $(CF); }
+:addx.b       eab_imm8,Rd               is eab_imm8;         opcode=20 & Rd                    { Rd[0,8] = Rd[0,8] + eab_imm8[0,8]    + $(CF); }
+:addx.w       eaw_direct,Rd             is eaw_direct;       opcode=20 & Rd                    { Rd      = Rd      + eaw_direct       + zext($(CF)); }
+:addx.w       eaw_indirect,Rd           is eaw_indirect;     opcode=20 & Rd                    { Rd      = Rd      + eaw_indirect     + zext($(CF)); }
+:addx.w       eaw_disp8,Rd              is eaw_disp8;        opcode=20 & Rd                    { Rd      = Rd      + eaw_disp8        + zext($(CF)); }
+:addx.w       eaw_disp16,Rd             is eaw_disp16;       opcode=20 & Rd                    { Rd      = Rd      + eaw_disp16       + zext($(CF)); }
+:addx.w       eaw_predec,Rd             is eaw_predec;       opcode=20 & Rd                    { Rd      = Rd      + eaw_predec       + zext($(CF)); }
+:addx.w       eaw_postinc,Rd            is eaw_postinc;      opcode=20 & Rd                    { Rd      = Rd      + eaw_postinc      + zext($(CF)); }
+:addx.w       eaw_abs8_br,Rd            is eaw_abs8_br;      opcode=20 & Rd                    { Rd      = Rd      + eaw_abs8_br      + zext($(CF)); }
+:addx.w       eaw_imm16,Rd              is eaw_imm16;        opcode=20 & Rd                    { Rd      = Rd      + eaw_imm16        + zext($(CF)); }
+:addx.b       eab_abs16,Rd       is eab_abs16; opcode=20 & Rd [targetBase = Rd; ] { Rd[0,8] = Rd[0,8] + eab_abs16 + $(CF); }
+:addx.w       eaw_abs16,Rd       is eaw_abs16; opcode=20 & Rd [targetBase = Rd; ] { Rd      = Rd      + eaw_abs16 + zext($(CF)); }
+
+# ADD:Q #xx,<EAd>          Add quick, short format
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs (e.g., 127 + 1 = -128)
+#       C: unsigned overflow: result u< Rd_original (e.g., 255 + 1 = 0)
+# The immediate value is determined by bits 0 and 2 of the opcode byte, but I couldn't find a clever way to use those bits directly, so I wrote the tables for -2,-1,+1,+2 individually.
+# +1
+:add:"q.b"    "#1",eab_direct          is eab_direct;  opcode_special = 0x8                { tmp = eab_direct[0,8]; addflags(tmp, 1); eab_direct[0,8]= tmp + 1; }
+:add:"q.b"    "#1",eab_indirect        is eab_indirect;opcode_special = 0x8                { tmp = eab_indirect   ; addflags(tmp, 1); eab_indirect   = tmp + 1; }
+:add:"q.b"    "#1",eab_disp8           is eab_disp8;   opcode_special = 0x8                { tmp = eab_disp8      ; addflags(tmp, 1); eab_disp8      = tmp + 1; }
+:add:"q.b"    "#1",eab_disp16          is eab_disp16;  opcode_special = 0x8                { tmp = eab_disp16     ; addflags(tmp, 1); eab_disp16     = tmp + 1; }
+:add:"q.b"    "#1",eab_predec          is eab_predec;  opcode_special = 0x8                { tmp = eab_predec     ; addflags(tmp, 1); eab_predec     = tmp + 1; }
+:add:"q.b"    "#1",eab_postinc         is eab_postinc; opcode_special = 0x8                { tmp = eab_postinc    ; addflags(tmp, 1); eab_postinc    = tmp + 1; }
+:add:"q.b"    "#1",eab_abs8_br         is eab_abs8_br; opcode_special = 0x8                { tmp = eab_abs8_br    ; addflags(tmp, 1); eab_abs8_br    = tmp + 1; }
+:add:"q.b"    "#1",eab_abs16           is eab_abs16;   opcode_special = 0x8 [targetBase=0;]{ tmp = eab_abs16      ; addflags(tmp, 1); eab_abs16      = tmp + 1; }
+:add:"q.w"    "#1",eaw_direct          is eaw_direct;  opcode_special = 0x8                { tmp = eaw_direct     ; addflags(tmp, 1); eaw_direct     = tmp + 1; }
+:add:"q.w"    "#1",eaw_indirect        is eaw_indirect;opcode_special = 0x8                { tmp = eaw_indirect   ; addflags(tmp, 1); eaw_indirect   = tmp + 1; }
+:add:"q.w"    "#1",eaw_disp8           is eaw_disp8;   opcode_special = 0x8                { tmp = eaw_disp8      ; addflags(tmp, 1); eaw_disp8      = tmp + 1; }
+:add:"q.w"    "#1",eaw_disp16          is eaw_disp16;  opcode_special = 0x8                { tmp = eaw_disp16     ; addflags(tmp, 1); eaw_disp16     = tmp + 1; }
+:add:"q.w"    "#1",eaw_predec          is eaw_predec;  opcode_special = 0x8                { tmp = eaw_predec     ; addflags(tmp, 1); eaw_predec     = tmp + 1; }
+:add:"q.w"    "#1",eaw_postinc         is eaw_postinc; opcode_special = 0x8                { tmp = eaw_postinc    ; addflags(tmp, 1); eaw_postinc    = tmp + 1; }
+:add:"q.w"    "#1",eaw_abs8_br         is eaw_abs8_br; opcode_special = 0x8                { tmp = eaw_abs8_br    ; addflags(tmp, 1); eaw_abs8_br    = tmp + 1; }
+:add:"q.w"    "#1",eaw_abs16           is eaw_abs16;   opcode_special = 0x8 [targetBase=0;]{ tmp = eaw_abs16      ; addflags(tmp, 1); eaw_abs16      = tmp + 1; }
+
+# +2
+:add:"q.b"    "#2",eab_direct          is eab_direct;  opcode_special = 0x9                { tmp = eab_direct[0,8]; addflags(tmp, 2); eab_direct[0,8]= tmp + 2; }
+:add:"q.b"    "#2",eab_indirect        is eab_indirect;opcode_special = 0x9                { tmp = eab_indirect   ; addflags(tmp, 2); eab_indirect   = tmp + 2; }
+:add:"q.b"    "#2",eab_disp8           is eab_disp8;   opcode_special = 0x9                { tmp = eab_disp8      ; addflags(tmp, 2); eab_disp8      = tmp + 2; }
+:add:"q.b"    "#2",eab_disp16          is eab_disp16;  opcode_special = 0x9                { tmp = eab_disp16     ; addflags(tmp, 2); eab_disp16     = tmp + 2; }
+:add:"q.b"    "#2",eab_predec          is eab_predec;  opcode_special = 0x9                { tmp = eab_predec     ; addflags(tmp, 2); eab_predec     = tmp + 2; }
+:add:"q.b"    "#2",eab_postinc         is eab_postinc; opcode_special = 0x9                { tmp = eab_postinc    ; addflags(tmp, 2); eab_postinc    = tmp + 2; }
+:add:"q.b"    "#2",eab_abs8_br         is eab_abs8_br; opcode_special = 0x9                { tmp = eab_abs8_br    ; addflags(tmp, 2); eab_abs8_br    = tmp + 2; }
+:add:"q.b"    "#2",eab_abs16           is eab_abs16;   opcode_special = 0x9 [targetBase=0;]{ tmp = eab_abs16      ; addflags(tmp, 2); eab_abs16      = tmp + 2; }
+:add:"q.w"    "#2",eaw_direct          is eaw_direct;  opcode_special = 0x9                { tmp = eaw_direct     ; addflags(tmp, 2); eaw_direct     = tmp + 2; }
+:add:"q.w"    "#2",eaw_indirect        is eaw_indirect;opcode_special = 0x9                { tmp = eaw_indirect   ; addflags(tmp, 2); eaw_indirect   = tmp + 2; }
+:add:"q.w"    "#2",eaw_disp8           is eaw_disp8;   opcode_special = 0x9                { tmp = eaw_disp8      ; addflags(tmp, 2); eaw_disp8      = tmp + 2; }
+:add:"q.w"    "#2",eaw_disp16          is eaw_disp16;  opcode_special = 0x9                { tmp = eaw_disp16     ; addflags(tmp, 2); eaw_disp16     = tmp + 2; }
+:add:"q.w"    "#2",eaw_predec          is eaw_predec;  opcode_special = 0x9                { tmp = eaw_predec     ; addflags(tmp, 2); eaw_predec     = tmp + 2; }
+:add:"q.w"    "#2",eaw_postinc         is eaw_postinc; opcode_special = 0x9                { tmp = eaw_postinc    ; addflags(tmp, 2); eaw_postinc    = tmp + 2; }
+:add:"q.w"    "#2",eaw_abs8_br         is eaw_abs8_br; opcode_special = 0x9                { tmp = eaw_abs8_br    ; addflags(tmp, 2); eaw_abs8_br    = tmp + 2; }
+:add:"q.w"    "#2",eaw_abs16           is eaw_abs16;   opcode_special = 0x9 [targetBase=0;]{ tmp = eaw_abs16      ; addflags(tmp, 2); eaw_abs16      = tmp + 2; }
+
+# -1
+:add:"q.b"    "#-1",eab_direct          is eab_direct;  opcode_special = 0xc                { tmp = eab_direct[0,8]; subflags(tmp, -1); eab_direct[0,8]= tmp - 1; }
+:add:"q.b"    "#-1",eab_indirect        is eab_indirect;opcode_special = 0xc                { tmp = eab_indirect   ; subflags(tmp, -1); eab_indirect   = tmp - 1; }
+:add:"q.b"    "#-1",eab_disp8           is eab_disp8;   opcode_special = 0xc                { tmp = eab_disp8      ; subflags(tmp, -1); eab_disp8      = tmp - 1; }
+:add:"q.b"    "#-1",eab_disp16          is eab_disp16;  opcode_special = 0xc                { tmp = eab_disp16     ; subflags(tmp, -1); eab_disp16     = tmp - 1; }
+:add:"q.b"    "#-1",eab_predec          is eab_predec;  opcode_special = 0xc                { tmp = eab_predec     ; subflags(tmp, -1); eab_predec     = tmp - 1; }
+:add:"q.b"    "#-1",eab_postinc         is eab_postinc; opcode_special = 0xc                { tmp = eab_postinc    ; subflags(tmp, -1); eab_postinc    = tmp - 1; }
+:add:"q.b"    "#-1",eab_abs8_br         is eab_abs8_br; opcode_special = 0xc                { tmp = eab_abs8_br    ; subflags(tmp, -1); eab_abs8_br    = tmp - 1; }
+:add:"q.b"    "#-1",eab_abs16           is eab_abs16;   opcode_special = 0xc [targetBase=0;]{ tmp = eab_abs16      ; subflags(tmp, -1); eab_abs16      = tmp - 1; }
+:add:"q.w"    "#-1",eaw_direct          is eaw_direct;  opcode_special = 0xc                { tmp = eaw_direct     ; subflags(tmp, -1); eaw_direct     = tmp - 1; }
+:add:"q.w"    "#-1",eaw_indirect        is eaw_indirect;opcode_special = 0xc                { tmp = eaw_indirect   ; subflags(tmp, -1); eaw_indirect   = tmp - 1; }
+:add:"q.w"    "#-1",eaw_disp8           is eaw_disp8;   opcode_special = 0xc                { tmp = eaw_disp8      ; subflags(tmp, -1); eaw_disp8      = tmp - 1; }
+:add:"q.w"    "#-1",eaw_disp16          is eaw_disp16;  opcode_special = 0xc                { tmp = eaw_disp16     ; subflags(tmp, -1); eaw_disp16     = tmp - 1; }
+:add:"q.w"    "#-1",eaw_predec          is eaw_predec;  opcode_special = 0xc                { tmp = eaw_predec     ; subflags(tmp, -1); eaw_predec     = tmp - 1; }
+:add:"q.w"    "#-1",eaw_postinc         is eaw_postinc; opcode_special = 0xc                { tmp = eaw_postinc    ; subflags(tmp, -1); eaw_postinc    = tmp - 1; }
+:add:"q.w"    "#-1",eaw_abs8_br         is eaw_abs8_br; opcode_special = 0xc                { tmp = eaw_abs8_br    ; subflags(tmp, -1); eaw_abs8_br    = tmp - 1; }
+:add:"q.w"    "#-1",eaw_abs16           is eaw_abs16;   opcode_special = 0xc [targetBase=0;]{ tmp = eaw_abs16      ; subflags(tmp, -1); eaw_abs16      = tmp - 1; }
+
+# -2
+:add:"q.b"    "#-2",eab_direct          is eab_direct;  opcode_special = 0xd                { tmp = eab_direct[0,8]; subflags(tmp, -2); eab_direct[0,8]= tmp - 2; }
+:add:"q.b"    "#-2",eab_indirect        is eab_indirect;opcode_special = 0xd                { tmp = eab_indirect   ; subflags(tmp, -2); eab_indirect   = tmp - 2; }
+:add:"q.b"    "#-2",eab_disp8           is eab_disp8;   opcode_special = 0xd                { tmp = eab_disp8      ; subflags(tmp, -2); eab_disp8      = tmp - 2; }
+:add:"q.b"    "#-2",eab_disp16          is eab_disp16;  opcode_special = 0xd                { tmp = eab_disp16     ; subflags(tmp, -2); eab_disp16     = tmp - 2; }
+:add:"q.b"    "#-2",eab_predec          is eab_predec;  opcode_special = 0xd                { tmp = eab_predec     ; subflags(tmp, -2); eab_predec     = tmp - 2; }
+:add:"q.b"    "#-2",eab_postinc         is eab_postinc; opcode_special = 0xd                { tmp = eab_postinc    ; subflags(tmp, -2); eab_postinc    = tmp - 2; }
+:add:"q.b"    "#-2",eab_abs8_br         is eab_abs8_br; opcode_special = 0xd                { tmp = eab_abs8_br    ; subflags(tmp, -2); eab_abs8_br    = tmp - 2; }
+:add:"q.b"    "#-2",eab_abs16           is eab_abs16;   opcode_special = 0xd [targetBase=0;]{ tmp = eab_abs16      ; subflags(tmp, -2); eab_abs16      = tmp - 2; }
+:add:"q.w"    "#-2",eaw_direct          is eaw_direct;  opcode_special = 0xd                { tmp = eaw_direct     ; subflags(tmp, -2); eaw_direct     = tmp - 2; }
+:add:"q.w"    "#-2",eaw_indirect        is eaw_indirect;opcode_special = 0xd                { tmp = eaw_indirect   ; subflags(tmp, -2); eaw_indirect   = tmp - 2; }
+:add:"q.w"    "#-2",eaw_disp8           is eaw_disp8;   opcode_special = 0xd                { tmp = eaw_disp8      ; subflags(tmp, -2); eaw_disp8      = tmp - 2; }
+:add:"q.w"    "#-2",eaw_disp16          is eaw_disp16;  opcode_special = 0xd                { tmp = eaw_disp16     ; subflags(tmp, -2); eaw_disp16     = tmp - 2; }
+:add:"q.w"    "#-2",eaw_predec          is eaw_predec;  opcode_special = 0xd                { tmp = eaw_predec     ; subflags(tmp, -2); eaw_predec     = tmp - 2; }
+:add:"q.w"    "#-2",eaw_postinc         is eaw_postinc; opcode_special = 0xd                { tmp = eaw_postinc    ; subflags(tmp, -2); eaw_postinc    = tmp - 2; }
+:add:"q.w"    "#-2",eaw_abs8_br         is eaw_abs8_br; opcode_special = 0xd                { tmp = eaw_abs8_br    ; subflags(tmp, -2); eaw_abs8_br    = tmp - 2; }
+:add:"q.w"    "#-2",eaw_abs16           is eaw_abs16;   opcode_special = 0xd [targetBase=0;]{ tmp = eaw_abs16      ; subflags(tmp, -2); eaw_abs16      = tmp - 2; }
+
+# DADD  Rs,Rd              Decimal (BCD) add with extended carry
+#       Z: Z == 1 && result == 0
+#       C: decimal carry occurred (mathematical result > 99)
+# If I understand correctly, this instruction does exist and will compute with Word operands, but "correct results are not assured."
+# I have not included a word-size version in this language spec, because I don't know how it will work.
+:dadd.b       Rn,Rd                     is mode=10 & sz = 0 & Rn; opcode_special=0; opcode=20 & Rd
+{
+	rs_low:2   = zext(Rn[0,4]);
+	rs_high:2  = zext(Rn[4,4]);
+	rd_low:2   = zext(Rd[0,4]);
+	rd_high:2  = zext(Rd[4,4]);
+	sum_low:2  = rs_low  + rd_low + zext($(CF));
+	sum_high:2 = rs_high + rd_high + (sum_low / 10);
+	Rd = (sum_low % 10) + ((sum_high % 10) * 10);
+	$(CF) = (sum_high >= 10);
+	$(ZF) = ($(ZF) == 1) && (Rd == 0);
+}
+
+# DSUB  Rs,Rd              Decimal (BCD) subtract with extended carry
+#       Z: Z == 1 && result == 0
+#       C: decimal borrow occurred (mathematical result < 0)
+# If I understand correctly, this instruction does exist and will compute with Word operands, but "correct results are not assured."
+# I have not included a word-size version in this language spec, because I don't know how it will work.
+:dsub.b       Rn,Rd                     is mode=10 & sz = 0 & Rn; opcode_special=0; opcode=22 & Rd
+{
+	rs_low:2   = 9 - zext(Rn[0,4]) + 1;
+	rs_high:2  = 9 - zext(Rn[4,4]);
+	rd_low:2   = zext(Rd[0,4]);
+	rd_high:2  = zext(Rd[4,4]);
+	diff_low:2  = rs_low  + rd_low  + zext($(CF));
+	diff_high:2 = rs_high + rd_high + (diff_low / 10);
+	Rd = (diff_low % 10) + ((diff_high % 10) * 10);
+	$(CF) = (diff_high < 10);
+	$(ZF) = ($(ZF) == 1) && (Rd == 0);
+}
+
+# STC   CR,<EAd>           Store control register
+#       no flags
+:stc.b        "CCR",eab_direct          is eab_direct;           opcode=19 & CR8=1               { CollectFlags(); eab_direct[0,8] = CCR; }
+:stc.b        "CCR",eab_indirect        is eab_indirect;         opcode=19 & CR8=1               { CollectFlags(); eab_indirect = CCR; }
+:stc.b        "CCR",eab_disp8           is eab_disp8;            opcode=19 & CR8=1               { CollectFlags(); eab_disp8 = CCR; }
+:stc.b        "CCR",eab_disp16          is eab_disp16;           opcode=19 & CR8=1               { CollectFlags(); eab_disp16 = CCR; }
+:stc.b        "CCR",eab_predec          is eab_predec;           opcode=19 & CR8=1               { CollectFlags(); eab_predec = CCR; }
+:stc.b        "CCR",eab_postinc         is eab_postinc;          opcode=19 & CR8=1               { CollectFlags(); eab_postinc = CCR; }
+:stc.b        "CCR",eab_abs8_br         is eab_abs8_br;          opcode=19 & CR8=1               { CollectFlags(); eab_abs8_br = CCR; }
+:stc.b        "CCR",eab_abs16           is eab_abs16;            opcode=19 & CR8=1               { CollectFlags(); eab_abs16 = CCR; }
+:stc.w        "SR",eaw_direct           is eaw_direct;           opcode=19 & CR16=0              { CollectFlags(); eaw_direct = SR; }
+:stc.w        "SR",eaw_indirect         is eaw_indirect;         opcode=19 & CR16=0              { CollectFlags(); eaw_indirect = SR; }
+:stc.w        "SR",eaw_disp8            is eaw_disp8;            opcode=19 & CR16=0              { CollectFlags(); eaw_disp8 = SR; }
+:stc.w        "SR",eaw_disp16           is eaw_disp16;           opcode=19 & CR16=0              { CollectFlags(); eaw_disp16 = SR; }
+:stc.w        "SR",eaw_predec           is eaw_predec;           opcode=19 & CR16=0              { CollectFlags(); eaw_predec = SR; }
+:stc.w        "SR",eaw_postinc          is eaw_postinc;          opcode=19 & CR16=0              { CollectFlags(); eaw_postinc = SR; }
+:stc.w        "SR",eaw_abs8_br          is eaw_abs8_br;          opcode=19 & CR16=0              { CollectFlags(); eaw_abs8_br = SR; }
+:stc.w        "SR",eaw_abs16            is eaw_abs16;            opcode=19 & CR16=0              { CollectFlags(); eaw_abs16 = SR; }
+:stc.b        CR8,eab_direct            is eab_direct;           opcode=19 & CR8                 { eab_direct[0,8] = CR8; }
+:stc.b        CR8,eab_indirect          is eab_indirect;         opcode=19 & CR8                 { eab_indirect = CR8; }
+:stc.b        CR8,eab_disp8             is eab_disp8;            opcode=19 & CR8                 { eab_disp8 = CR8; }
+:stc.b        CR8,eab_disp16            is eab_disp16;           opcode=19 & CR8                 { eab_disp16 = CR8; }
+:stc.b        CR8,eab_predec            is eab_predec;           opcode=19 & CR8                 { eab_predec = CR8; }
+:stc.b        CR8,eab_postinc           is eab_postinc;          opcode=19 & CR8                 { eab_postinc = CR8; }
+:stc.b        CR8,eab_abs8_br           is eab_abs8_br;          opcode=19 & CR8                 { eab_abs8_br = CR8; }
+:stc.b        CR8,eab_abs16             is eab_abs16;            opcode=19 & CR8                 { eab_abs16 = CR8; }
+:stc.w        CR16,eaw_direct           is eaw_direct;           opcode=19 & CR16                { eaw_direct = CR16; }
+:stc.w        CR16,eaw_indirect         is eaw_indirect;         opcode=19 & CR16                { eaw_indirect = CR16; }
+:stc.w        CR16,eaw_disp8            is eaw_disp8;            opcode=19 & CR16                { eaw_disp8 = CR16; }
+:stc.w        CR16,eaw_disp16           is eaw_disp16;           opcode=19 & CR16                { eaw_disp16 = CR16; }
+:stc.w        CR16,eaw_predec           is eaw_predec;           opcode=19 & CR16                { eaw_predec = CR16; }
+:stc.w        CR16,eaw_postinc          is eaw_postinc;          opcode=19 & CR16                { eaw_postinc = CR16; }
+:stc.w        CR16,eaw_abs8_br             is eaw_abs8_br;             opcode=19 & CR16                { eaw_abs8_br = CR16; }
+:stc.w        CR16,eaw_abs16     is eaw_abs16;     opcode=19 & CR16 [targetBase=0;]{ eaw_abs16 = CR16; }
+
+# STM   <regs>,@-SP        Store multiple registers
+#       no flags
+:stm          (r0_push^r1_push^r2_push^r3_push^r4_push^r5_push^fp_push^sp_push),"@-SP"          is opcode_special=0x12; r0_push & r1_push & r2_push & r3_push & r4_push & r5_push & fp_push & sp_push { }
+
+# LDM   @SP+,<regs>        Load to multiple registers
+#       no flags
+:ldm.w        "@SP+",(sp_pop^fp_pop^r5_pop^r4_pop^r3_pop^r2_pop^r1_pop^r0_pop)          is opcode_special=2; sp_pop & fp_pop & r5_pop & r4_pop & r3_pop & r2_pop & r1_pop & r0_pop { }
+
+# XCH   Rs,Rd              Exchange registers
+#       no flags
+:xch.w        eaw_direct,Rd             is eaw_direct; opcode=18 & Rd { local tmp=Rd; Rd=eaw_direct; eaw_direct=Rd; }
+
+# SWAP  Rd                 Swap register halves
+#       N: result s< 0
+#       Z: result == 0
+#       V: 0
+# The encoding specifies byte-sized registers, but since we pass the full word down in eab_direct, we should be able to use eab_direct instead of manually encoding the address mode with Rn
+:swap.b       eab_direct                is eab_direct; opcode=2 & Rd=0 { local tmp=eab_direct[0,8]; eab_direct[0,8] = eab_direct[8,8]; eab_direct[8,8] = tmp; }
+
+# BCLR  Rs,<EAd>           Bit test and clear
+#       Z: EAd_orig[Rs] == 0
+:bclr.b       Rs,eab_direct             is eab_direct;       opcode=11 & Rs                { $(ZF) = (eab_direct[0,8]   & (1 << Rs)) == 0; tmp:1 = eab_direct[0,8]  & ~(1 << Rs); eab_direct[0,8] = tmp; }
+:bclr.b       Rs,eab_indirect           is eab_indirect;     opcode=11 & Rs                { $(ZF) = (eab_indirect      & (1 << Rs)) == 0; tmp:1 = eab_indirect     & ~(1 << Rs); eab_indirect = tmp; }
+:bclr.b       Rs,eab_disp8              is eab_disp8;        opcode=11 & Rs                { $(ZF) = (eab_disp8         & (1 << Rs)) == 0; tmp:1 = eab_disp8        & ~(1 << Rs); eab_disp8 = tmp; }
+:bclr.b       Rs,eab_disp16             is eab_disp16;       opcode=11 & Rs                { $(ZF) = (eab_disp16        & (1 << Rs)) == 0; tmp:1 = eab_disp16       & ~(1 << Rs); eab_disp16 = tmp; }
+:bclr.b       Rs,eab_predec             is eab_predec;       opcode=11 & Rs                { $(ZF) = (eab_predec        & (1 << Rs)) == 0; tmp:1 = eab_predec       & ~(1 << Rs); eab_predec = tmp; }
+:bclr.b       Rs,eab_postinc            is eab_postinc;      opcode=11 & Rs                { $(ZF) = (eab_postinc       & (1 << Rs)) == 0; tmp:1 = eab_postinc      & ~(1 << Rs); eab_postinc = tmp; }
+:bclr.b       Rs,eab_abs8_br            is eab_abs8_br;      opcode=11 & Rs                { $(ZF) = (eab_abs8_br       & (1 << Rs)) == 0; tmp:1 = eab_abs8_br      & ~(1 << Rs); eab_abs8_br = tmp; }
+:bclr.b       Rs,eab_abs16       is eab_abs16; opcode=11 & Rs [targetBase=0;]{ $(ZF) = (eab_abs16  & (1 << Rs)) == 0; tmp:1 = eab_abs16 & ~(1 << Rs); eab_abs16 = tmp; }
+:bclr.w       Rs,eaw_direct             is eaw_direct;       opcode=11 & Rs                { $(ZF) = (eaw_direct        & (1 << Rs)) == 0; tmp:2 = eaw_direct       & ~(1 << Rs); eaw_direct = tmp; }
+:bclr.w       Rs,eaw_indirect           is eaw_indirect;     opcode=11 & Rs                { $(ZF) = (eaw_indirect      & (1 << Rs)) == 0; tmp:2 = eaw_indirect     & ~(1 << Rs); eaw_indirect = tmp; }
+:bclr.w       Rs,eaw_disp8              is eaw_disp8;        opcode=11 & Rs                { $(ZF) = (eaw_disp8         & (1 << Rs)) == 0; tmp:2 = eaw_disp8        & ~(1 << Rs); eaw_disp8 = tmp; }
+:bclr.w       Rs,eaw_disp16             is eaw_disp16;       opcode=11 & Rs                { $(ZF) = (eaw_disp16        & (1 << Rs)) == 0; tmp:2 = eaw_disp16       & ~(1 << Rs); eaw_disp16 = tmp; }
+:bclr.w       Rs,eaw_predec             is eaw_predec;       opcode=11 & Rs                { $(ZF) = (eaw_predec        & (1 << Rs)) == 0; tmp:2 = eaw_predec       & ~(1 << Rs); eaw_predec = tmp; }
+:bclr.w       Rs,eaw_postinc            is eaw_postinc;      opcode=11 & Rs                { $(ZF) = (eaw_postinc       & (1 << Rs)) == 0; tmp:2 = eaw_postinc      & ~(1 << Rs); eaw_postinc = tmp; }
+:bclr.w       Rs,eaw_abs8_br            is eaw_abs8_br;      opcode=11 & Rs                { $(ZF) = (eaw_abs8_br       & (1 << Rs)) == 0; tmp:2 = eaw_abs8_br      & ~(1 << Rs); eaw_abs8_br = tmp; }
+:bclr.w       Rs,eaw_abs16       is eaw_abs16; opcode=11 & Rs [targetBase=0;]{ $(ZF) = (eaw_abs16  & (1 << Rs)) == 0; tmp:2 = eaw_abs16 & ~(1 << Rs); eaw_abs16 = tmp; }
+
+# BCLR  #xx,<EAd>          Bit test and clear
+#       Z: EAd_orig[xx] == 0
+:bclr.b       op_imm4,eab_direct        is eab_direct;       opcode47=13 & op_imm4                { tmp:1 = eab_direct[0,8] ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eab_direct[0,8] = tmp; }
+:bclr.b       op_imm4,eab_indirect      is eab_indirect;     opcode47=13 & op_imm4                { tmp:1 = eab_indirect    ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eab_indirect = tmp; }
+:bclr.b       op_imm4,eab_disp8         is eab_disp8;        opcode47=13 & op_imm4                { tmp:1 = eab_disp8       ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eab_disp8 = tmp; }
+:bclr.b       op_imm4,eab_disp16        is eab_disp16;       opcode47=13 & op_imm4                { tmp:1 = eab_disp16      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eab_disp16 = tmp; }
+:bclr.b       op_imm4,eab_predec        is eab_predec;       opcode47=13 & op_imm4                { tmp:1 = eab_predec      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eab_predec = tmp; }
+:bclr.b       op_imm4,eab_postinc       is eab_postinc;      opcode47=13 & op_imm4                { tmp:1 = eab_postinc     ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eab_postinc = tmp; }
+:bclr.b       op_imm4,eab_abs8_br       is eab_abs8_br;      opcode47=13 & op_imm4                { tmp:1 = eab_abs8_br     ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eab_abs8_br = tmp; }
+:bclr.b       op_imm4,eab_abs16  is eab_abs16; opcode47=13 & op_imm4 [targetBase=0;]{ tmp:1 = eab_abs16; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eab_abs16 = tmp; }
+:bclr.w       op_imm4,eaw_direct        is eaw_direct;       opcode47=13 & op_imm4                { tmp:2 = eaw_direct      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eaw_direct = tmp; }
+:bclr.w       op_imm4,eaw_indirect      is eaw_indirect;     opcode47=13 & op_imm4                { tmp:2 = eaw_indirect    ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eaw_indirect = tmp; }
+:bclr.w       op_imm4,eaw_disp8         is eaw_disp8;        opcode47=13 & op_imm4                { tmp:2 = eaw_disp8       ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eaw_disp8 = tmp; }
+:bclr.w       op_imm4,eaw_disp16        is eaw_disp16;       opcode47=13 & op_imm4                { tmp:2 = eaw_disp16      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eaw_disp16 = tmp; }
+:bclr.w       op_imm4,eaw_predec        is eaw_predec;       opcode47=13 & op_imm4                { tmp:2 = eaw_predec      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eaw_predec = tmp; }
+:bclr.w       op_imm4,eaw_postinc       is eaw_postinc;      opcode47=13 & op_imm4                { tmp:2 = eaw_postinc     ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eaw_postinc = tmp; }
+:bclr.b       op_imm4,eaw_abs8_br       is eaw_abs8_br;      opcode47=13 & op_imm4                { tmp:2 = eaw_abs8_br     ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eaw_abs8_br = tmp; }
+:bclr.w       op_imm4,eaw_abs16  is eaw_abs16; opcode47=13 & op_imm4 [targetBase=0;]{ tmp:2 = eaw_abs16; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp & ~(1 << op_imm4); eaw_abs16 = tmp; }
+
+# BSET  RS,<EAd>           Bit test and set
+#       Z: EAd_orig[xx] == 0
+:bset.b       Rs,eab_direct         is eab_direct;       opcode=9 & Rs                 { tmp:1 = eab_direct[0,8] ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eab_direct[0,8] = tmp; }
+:bset.b       Rs,eab_indirect       is eab_indirect;     opcode=9 & Rs                 { tmp:1 = eab_indirect    ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eab_indirect = tmp; }
+:bset.b       Rs,eab_disp8          is eab_disp8;        opcode=9 & Rs                 { tmp:1 = eab_disp8       ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eab_disp8 = tmp; }
+:bset.b       Rs,eab_disp16         is eab_disp16;       opcode=9 & Rs                 { tmp:1 = eab_disp16      ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eab_disp16 = tmp; }
+:bset.b       Rs,eab_predec         is eab_predec;       opcode=9 & Rs                 { tmp:1 = eab_predec      ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eab_predec = tmp; }
+:bset.b       Rs,eab_postinc        is eab_postinc;      opcode=9 & Rs                 { tmp:1 = eab_postinc     ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eab_postinc = tmp; }
+:bset.b       Rs,eab_abs8_br        is eab_abs8_br;      opcode=9 & Rs                 { tmp:1 = eab_abs8_br     ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eab_abs8_br = tmp; }
+:bset.b       Rs,eab_abs16   is eab_abs16; opcode=9 & Rs [targetBase=Rs;]{ tmp:1 = eab_abs16; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eab_abs16 = tmp; }
+:bset.w       Rs,eaw_direct         is eaw_direct;       opcode=9 & Rs                 { tmp:2 = eaw_direct      ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eaw_direct = tmp; }
+:bset.w       Rs,eaw_indirect       is eaw_indirect;     opcode=9 & Rs                 { tmp:2 = eaw_indirect    ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eaw_indirect = tmp; }
+:bset.w       Rs,eaw_disp8          is eaw_disp8;        opcode=9 & Rs                 { tmp:2 = eaw_disp8       ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eaw_disp8 = tmp; }
+:bset.w       Rs,eaw_disp16         is eaw_disp16;       opcode=9 & Rs                 { tmp:2 = eaw_disp16      ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eaw_disp16 = tmp; }
+:bset.w       Rs,eaw_predec         is eaw_predec;       opcode=9 & Rs                 { tmp:2 = eaw_predec      ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eaw_predec = tmp; }
+:bset.w       Rs,eaw_postinc        is eaw_postinc;      opcode=9 & Rs                 { tmp:2 = eaw_postinc     ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eaw_postinc = tmp; }
+:bset.w       Rs,eaw_abs8_br        is eaw_abs8_br;      opcode=9 & Rs                 { tmp:2 = eaw_abs8_br     ; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eaw_abs8_br = tmp; }
+:bset.w       Rs,eaw_abs16   is eaw_abs16; opcode=9 & Rs [targetBase=Rs;]{ tmp:2 = eaw_abs16; $(ZF) = (tmp & (1 << Rs)) == 0; tmp = tmp | (1 << Rs); eaw_abs16 = tmp; }
+
+# BSET  #xx,<EAd>          Bit test and set
+#       Z: EAd_orig[xx] == 0
+:bset.b       eab_direct,op_imm4         is eab_direct;       opcode47=12 & op_imm4                 { tmp:1 = eab_direct[0,8] ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eab_direct[0,8] = tmp; }
+:bset.b       eab_indirect,op_imm4       is eab_indirect;     opcode47=12 & op_imm4                 { tmp:1 = eab_indirect    ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eab_indirect = tmp; }
+:bset.b       eab_disp8,op_imm4          is eab_disp8;        opcode47=12 & op_imm4                 { tmp:1 = eab_disp8       ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eab_disp8 = tmp; }
+:bset.b       eab_disp16,op_imm4         is eab_disp16;       opcode47=12 & op_imm4                 { tmp:1 = eab_disp16      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eab_disp16 = tmp; }
+:bset.b       eab_predec,op_imm4         is eab_predec;       opcode47=12 & op_imm4                 { tmp:1 = eab_predec      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eab_predec = tmp; }
+:bset.b       eab_postinc,op_imm4        is eab_postinc;      opcode47=12 & op_imm4                 { tmp:1 = eab_postinc     ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eab_postinc = tmp; }
+:bset.b       eab_abs8_br,op_imm4        is eab_abs8_br;      opcode47=12 & op_imm4                 { tmp:1 = eab_abs8_br     ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eab_abs8_br = tmp; }
+:bset.b       eab_abs16,op_imm4   is eab_abs16; opcode47=12 & op_imm4 [targetBase=0;] { tmp:1 = eab_abs16; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eab_abs16 = tmp; }
+:bset.w       eaw_direct,op_imm4         is eaw_direct;       opcode47=12 & op_imm4                 { tmp:2 = eaw_direct      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eaw_direct = tmp; }
+:bset.w       eaw_indirect,op_imm4       is eaw_indirect;     opcode47=12 & op_imm4                 { tmp:2 = eaw_indirect    ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eaw_indirect = tmp; }
+:bset.w       eaw_disp8,op_imm4          is eaw_disp8;        opcode47=12 & op_imm4                 { tmp:2 = eaw_disp8       ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eaw_disp8 = tmp; }
+:bset.w       eaw_disp16,op_imm4         is eaw_disp16;       opcode47=12 & op_imm4                 { tmp:2 = eaw_disp16      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eaw_disp16 = tmp; }
+:bset.w       eaw_predec,op_imm4         is eaw_predec;       opcode47=12 & op_imm4                 { tmp:2 = eaw_predec      ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eaw_predec = tmp; }
+:bset.w       eaw_postinc,op_imm4        is eaw_postinc;      opcode47=12 & op_imm4                 { tmp:2 = eaw_postinc     ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eaw_postinc = tmp; }
+:bset.w       eaw_abs8_br,op_imm4        is eaw_abs8_br;      opcode47=12 & op_imm4                 { tmp:2 = eaw_abs8_br     ; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eaw_abs8_br = tmp; }
+:bset.w       eaw_abs16,op_imm4   is eaw_abs16; opcode47=12 & op_imm4 [targetBase=0;] { tmp:2 = eaw_abs16; $(ZF) = (tmp & (1 << op_imm4)) == 0; tmp = tmp | (1 << op_imm4); eaw_abs16 = tmp; }
+
+# BTST  Rs,<EAd>           Bit test and set
+#       Z: EAd[Rs] == 0
+:btst.b       Rs, eab_direct          is eab_direct;       opcode=15 & Rs                 { $(ZF) = (eab_direct[0,8] & (1 << Rs)) == 0;       }
+:btst.b       Rs, eab_indirect        is eab_indirect;     opcode=15 & Rs                 { $(ZF) = (eab_indirect & (1 << Rs)) == 0;     }
+:btst.b       Rs, eab_disp8           is eab_disp8;        opcode=15 & Rs                 { $(ZF) = (eab_disp8 & (1 << Rs)) == 0;        }
+:btst.b       Rs, eab_disp16          is eab_disp16;       opcode=15 & Rs                 { $(ZF) = (eab_disp16 & (1 << Rs)) == 0;       }
+:btst.b       Rs, eab_predec          is eab_predec;       opcode=15 & Rs                 { $(ZF) = (eab_predec & (1 << Rs)) == 0;       }
+:btst.b       Rs, eab_postinc         is eab_postinc;      opcode=15 & Rs                 { $(ZF) = (eab_postinc & (1 << Rs)) == 0;      }
+:btst.b       Rs, eab_abs8_br         is eab_abs8_br;      opcode=15 & Rs                 { $(ZF) = (eab_abs8_br & (1 << Rs)) == 0;      }
+:btst.b       Rs, eab_abs16    is eab_abs16; opcode=15 & Rs [targetBase=Rs;]{ $(ZF) = (eab_abs16 & (1 << Rs)) == 0; }
+:btst.w       Rs, eaw_direct          is eaw_direct;       opcode=15 & Rs                 { $(ZF) = (eaw_direct & (1 << Rs)) == 0;       }
+:btst.w       Rs, eaw_indirect        is eaw_indirect;     opcode=15 & Rs                 { $(ZF) = (eaw_indirect & (1 << Rs)) == 0;     }
+:btst.w       Rs, eaw_disp8           is eaw_disp8;        opcode=15 & Rs                 { $(ZF) = (eaw_disp8 & (1 << Rs)) == 0;        }
+:btst.w       Rs, eaw_disp16          is eaw_disp16;       opcode=15 & Rs                 { $(ZF) = (eaw_disp16 & (1 << Rs)) == 0;       }
+:btst.w       Rs, eaw_predec          is eaw_predec;       opcode=15 & Rs                 { $(ZF) = (eaw_predec & (1 << Rs)) == 0;       }
+:btst.w       Rs, eaw_postinc         is eaw_postinc;      opcode=15 & Rs                 { $(ZF) = (eaw_postinc & (1 << Rs)) == 0;      }
+:btst.w       Rs, eaw_abs8_br         is eaw_abs8_br;      opcode=15 & Rs                 { $(ZF) = (eaw_abs8_br & (1 << Rs)) == 0;      }
+:btst.w       Rs, eaw_abs16    is eaw_abs16; opcode=15 & Rs [targetBase=Rs;]{ $(ZF) = (eaw_abs16 & (1 << Rs)) == 0; }
+
+# BTST  #xx,<EAd>          Bit test and set
+#       Z: EAd[xx] == 0
+:btst.b       op_imm4, eab_direct          is eab_direct;       opcode47=15 & op_imm4                 { $(ZF) = (eab_direct[0,8] & (1 << op_imm4)) == 0;       }
+:btst.b       op_imm4, eab_indirect        is eab_indirect;     opcode47=15 & op_imm4                 { $(ZF) = (eab_indirect & (1 << op_imm4)) == 0;     }
+:btst.b       op_imm4, eab_disp8           is eab_disp8;        opcode47=15 & op_imm4                 { $(ZF) = (eab_disp8 & (1 << op_imm4)) == 0;        }
+:btst.b       op_imm4, eab_disp16          is eab_disp16;       opcode47=15 & op_imm4                 { $(ZF) = (eab_disp16 & (1 << op_imm4)) == 0;       }
+:btst.b       op_imm4, eab_predec          is eab_predec;       opcode47=15 & op_imm4                 { $(ZF) = (eab_predec & (1 << op_imm4)) == 0;       }
+:btst.b       op_imm4, eab_postinc         is eab_postinc;      opcode47=15 & op_imm4                 { $(ZF) = (eab_postinc & (1 << op_imm4)) == 0;      }
+:btst.b       op_imm4, eab_abs8_br         is eab_abs8_br;      opcode47=15 & op_imm4                 { $(ZF) = (eab_abs8_br & (1 << op_imm4)) == 0;      }
+:btst.b       op_imm4, eab_abs16    is eab_abs16; opcode47=15 & op_imm4 [targetBase=0;] { $(ZF) = (eab_abs16 & (1 << op_imm4)) == 0; }
+:btst.w       op_imm4, eaw_direct          is eaw_direct;       opcode47=15 & op_imm4                 { $(ZF) = (eaw_direct & (1 << op_imm4)) == 0;       }
+:btst.w       op_imm4, eaw_indirect        is eaw_indirect;     opcode47=15 & op_imm4                 { $(ZF) = (eaw_indirect & (1 << op_imm4)) == 0;     }
+:btst.w       op_imm4, eaw_disp8           is eaw_disp8;        opcode47=15 & op_imm4                 { $(ZF) = (eaw_disp8 & (1 << op_imm4)) == 0;        }
+:btst.w       op_imm4, eaw_disp16          is eaw_disp16;       opcode47=15 & op_imm4                 { $(ZF) = (eaw_disp16 & (1 << op_imm4)) == 0;       }
+:btst.w       op_imm4, eaw_predec          is eaw_predec;       opcode47=15 & op_imm4                 { $(ZF) = (eaw_predec & (1 << op_imm4)) == 0;       }
+:btst.w       op_imm4, eaw_postinc         is eaw_postinc;      opcode47=15 & op_imm4                 { $(ZF) = (eaw_postinc & (1 << op_imm4)) == 0;      }
+:btst.w       op_imm4, eaw_abs8_br         is eaw_abs8_br;      opcode47=15 & op_imm4                 { $(ZF) = (eaw_abs8_br & (1 << op_imm4)) == 0;      }
+:btst.w       op_imm4, eaw_abs16    is eaw_abs16; opcode47=15 & op_imm4 [targetBase=0;] { $(ZF) = (eaw_abs16 & (1 << op_imm4)) == 0; }
+
+# ANDC  #xx,CR             AND control register
+#       If CR refers to SR or CCR, the flags are set to the input value of this instruction. Otherwise:
+#       N: MSG(CR) == 1
+#       Z: CR == 0
+#       V: 0
+:andc.b       eab_imm8,"CCR"             is eab_imm8;  opcode=11 & CR8 =1 { CCR = CCR & eab_imm8;  SpreadFlags(); }
+:andc.w       eaw_imm16,"SR"             is eaw_imm16; opcode=11 & CR16=0 {  SR = SR  & eaw_imm16; SpreadFlags(); }
+:andc.b       eab_imm8,"TP"              is eab_imm8;  opcode=11 & CR8 =7 { $(ZF) = eab_imm8  == 0; $(NF) = eab_imm8  s< 0; $(VF) = 0; TP   = TP   & eab_imm8;  FPH = TP; }
+:andc.b       eab_imm8,CR8               is eab_imm8;  opcode=11 & CR8    { $(ZF) = eab_imm8  == 0; $(NF) = eab_imm8  s< 0; $(VF) = 0; CR8  = CR8  & eab_imm8;  }
+:andc.w       eaw_imm16,CR16             is eaw_imm16; opcode=11 & CR16   { $(ZF) = eaw_imm16 == 0; $(NF) = eaw_imm16 s< 0; $(VF) = 0; CR16 = CR16 & eaw_imm16; }
+
+# ORC   #xx,CR             OR control register
+#       If CR refers to SR or CCR, the flags are set to the input value of this instruction. Otherwise:
+#       N: MSG(CR) == 1
+#       Z: CR == 0
+#       V: 0
+:orc.b        eab_imm8,"CCR"             is eab_imm8;  opcode=9  & CR8 =1 { CCR  = CCR  | eab_imm8;  SpreadFlags();  }
+:orc.w        eaw_imm16,"SR"             is eaw_imm16; opcode=9  & CR16=0 { SR   = SR   | eaw_imm16; SpreadFlags(); }
+:orc.b        eab_imm8,"TP"              is eab_imm8;  opcode=9  & CR8 =7 { $(ZF) = eab_imm8  == 0; $(NF) = eab_imm8  s< 0; $(VF) = 0; TP   = TP   | eab_imm8;  FPH = TP; }
+:orc.b        eab_imm8,CR8               is eab_imm8;  opcode=9  & CR8    { $(ZF) = eab_imm8  == 0; $(NF) = eab_imm8  s< 0; $(VF) = 0; CR8  = CR8  | eab_imm8;  }
+:orc.w        eaw_imm16,CR16             is eaw_imm16; opcode=9  & CR16   { $(ZF) = eaw_imm16 == 0; $(NF) = eaw_imm16 s< 0; $(VF) = 0; CR16 = CR16 | eaw_imm16; }
+
+# ANDC  #xx,CR             XOR control register
+#       If CR refers to SR or CCR, the flags are set to the input value of this instruction. Otherwise:
+#       N: MSG(CR) == 1
+#       Z: CR == 0
+#       V: 0
+:xorc.b       eab_imm8,"CCR"             is eab_imm8;  opcode=13 & CR8 =1 { CCR  = CCR  ^ eab_imm8;  SpreadFlags();  }
+:xorc.w       eaw_imm16,"SR"             is eaw_imm16; opcode=13 & CR16=0 { SR   = SR   ^ eaw_imm16; SpreadFlags(); }
+:xorc.b       eab_imm8,"TP"              is eab_imm8;  opcode=13 & CR8 =7 { $(ZF) = eab_imm8  == 0; $(NF) = eab_imm8  s< 0; $(VF) = 0; TP   = TP   ^ eab_imm8;  FPH = TP; }
+:xorc.b       eab_imm8,CR8               is eab_imm8;  opcode=13 & CR8    { $(ZF) = eab_imm8  == 0; $(NF) = eab_imm8  s< 0; $(VF) = 0; CR8  = CR8  ^ eab_imm8;  }
+:xorc.w       eaw_imm16,CR16             is eaw_imm16; opcode=13 & CR16   { $(ZF) = eaw_imm16 == 0; $(NF) = eaw_imm16 s< 0; $(VF) = 0; CR16 = CR16 ^ eaw_imm16; }
+
+# LDC   <EAs>,CR           Load to control register
+#       If CR refers to SR or CCR, the flags are set to the input value of this instruction.
+#       No flags otherwise.
+:ldc.b        eab_direct,"CCR"            is eab_direct;       opcode=17 & CR8=1                 { CCR  = eab_direct[0,8]; SpreadFlags(); }
+:ldc.b        eab_indirect,"CCR"          is eab_indirect;     opcode=17 & CR8=1                 { CCR  = eab_indirect; SpreadFlags(); }
+:ldc.b        eab_disp8,"CCR"             is eab_disp8;        opcode=17 & CR8=1                 { CCR  = eab_disp8; SpreadFlags(); }
+:ldc.b        eab_disp16,"CCR"            is eab_disp16;       opcode=17 & CR8=1                 { CCR  = eab_disp16; SpreadFlags(); }
+:ldc.b        eab_predec,"CCR"            is eab_predec;       opcode=17 & CR8=1                 { CCR  = eab_predec; SpreadFlags(); }
+:ldc.b        eab_postinc,"CCR"           is eab_postinc;      opcode=17 & CR8=1                 { CCR  = eab_postinc; SpreadFlags(); }
+:ldc.b        eab_abs8_br,"CCR"              is eab_abs8_br;         opcode=17 & CR8=1                 { CCR  = eab_abs8_br; SpreadFlags(); }
+:ldc.b        eab_abs16,"CCR"             is eab_abs16;        opcode=17 & CR8=1                 { CCR  = eab_abs16; SpreadFlags(); }
+:ldc.b        eab_imm8,"CCR"              is eab_imm8;         opcode=17 & CR8=1                 { CCR  = eab_imm8; SpreadFlags(); }
+:ldc.b        eab_direct,"TP"            is eab_direct;       opcode=17 & CR8=7                 { TP  = eab_direct[0,8]; SpreadFlags(); FPH = TP; }
+:ldc.b        eab_indirect,"TP"          is eab_indirect;     opcode=17 & CR8=7                 { TP  = eab_indirect; SpreadFlags(); FPH = TP; }
+:ldc.b        eab_disp8,"TP"             is eab_disp8;        opcode=17 & CR8=7                 { TP  = eab_disp8; SpreadFlags(); FPH = TP; }
+:ldc.b        eab_disp16,"TP"            is eab_disp16;       opcode=17 & CR8=7                 { TP  = eab_disp16; SpreadFlags(); FPH = TP; }
+:ldc.b        eab_predec,"TP"            is eab_predec;       opcode=17 & CR8=7                 { TP  = eab_predec; SpreadFlags(); FPH = TP; }
+:ldc.b        eab_postinc,"TP"           is eab_postinc;      opcode=17 & CR8=7                 { TP  = eab_postinc; SpreadFlags(); FPH = TP; }
+:ldc.b        eab_abs8_br,"TP"              is eab_abs8_br;         opcode=17 & CR8=7                 { TP  = eab_abs8_br; SpreadFlags(); FPH = TP; }
+:ldc.b        eab_abs16,"TP"             is eab_abs16;        opcode=17 & CR8=7                 { TP  = eab_abs16; SpreadFlags(); FPH = TP; }
+:ldc.b        eab_imm8,"TP"              is eab_imm8;         opcode=17 & CR8=7                 { TP  = eab_imm8; SpreadFlags(); FPH = TP; }
+:ldc.w        eaw_direct,"SR"           is eaw_direct;       opcode=17 & CR16=0                { SR = eaw_direct; SpreadFlags(); }
+:ldc.w        eaw_indirect,"SR"         is eaw_indirect;     opcode=17 & CR16=0                { SR = eaw_indirect; SpreadFlags(); }
+:ldc.w        eaw_disp8,"SR"            is eaw_disp8;        opcode=17 & CR16=0                { SR = eaw_disp8; SpreadFlags(); }
+:ldc.w        eaw_disp16,"SR"           is eaw_disp16;       opcode=17 & CR16=0                { SR = eaw_disp16; SpreadFlags(); }
+:ldc.w        eaw_predec,"SR"           is eaw_predec;       opcode=17 & CR16=0                { SR = eaw_predec; SpreadFlags(); }
+:ldc.w        eaw_postinc,"SR"          is eaw_postinc;      opcode=17 & CR16=0                { SR = eaw_postinc; SpreadFlags(); }
+:ldc.w        eaw_abs8_br,"SR"             is eaw_abs8_br;         opcode=17 & CR16=0                { SR = eaw_abs8_br; SpreadFlags(); }
+:ldc.w        eaw_abs16,"SR"            is eaw_abs16;        opcode=17 & CR16=0                { SR = eaw_abs16; SpreadFlags(); }
+:ldc.w        eaw_imm16,"SR"            is eaw_imm16;        opcode=17 & CR16=0                { SR = eaw_imm16; SpreadFlags(); }
+:ldc.b        eab_direct,CR8            is eab_direct;       opcode=17 & CR8                 { CR8  = eab_direct[0,8]; }
+:ldc.b        eab_indirect,CR8          is eab_indirect;     opcode=17 & CR8                 { CR8  = eab_indirect; }
+:ldc.b        eab_disp8,CR8             is eab_disp8;        opcode=17 & CR8                 { CR8  = eab_disp8; }
+:ldc.b        eab_disp16,CR8            is eab_disp16;       opcode=17 & CR8                 { CR8  = eab_disp16; }
+:ldc.b        eab_predec,CR8            is eab_predec;       opcode=17 & CR8                 { CR8  = eab_predec; }
+:ldc.b        eab_postinc,CR8           is eab_postinc;      opcode=17 & CR8                 { CR8  = eab_postinc; }
+:ldc.b        eab_abs8_br,CR8              is eab_abs8_br;         opcode=17 & CR8                 { CR8  = eab_abs8_br; }
+:ldc.b        eab_abs16,CR8             is eab_abs16;        opcode=17 & CR8                 { CR8  = eab_abs16; }
+:ldc.b        eab_imm8,CR8              is eab_imm8;         opcode=17 & CR8                 { CR8  = eab_imm8; }
+:ldc.w        eaw_direct,CR16           is eaw_direct;       opcode=17 & CR16                { CR16 = eaw_direct; }
+:ldc.w        eaw_indirect,CR16         is eaw_indirect;     opcode=17 & CR16                { CR16 = eaw_indirect; }
+:ldc.w        eaw_disp8,CR16            is eaw_disp8;        opcode=17 & CR16                { CR16 = eaw_disp8; }
+:ldc.w        eaw_disp16,CR16           is eaw_disp16;       opcode=17 & CR16                { CR16 = eaw_disp16; }
+:ldc.w        eaw_predec,CR16           is eaw_predec;       opcode=17 & CR16                { CR16 = eaw_predec; }
+:ldc.w        eaw_postinc,CR16          is eaw_postinc;      opcode=17 & CR16                { CR16 = eaw_postinc; }
+:ldc.w        eaw_abs8_br,CR16             is eaw_abs8_br;         opcode=17 & CR16                { CR16 = eaw_abs8_br; }
+:ldc.w        eaw_abs16,CR16            is eaw_abs16;        opcode=17 & CR16                { CR16 = eaw_abs16; }
+:ldc.w        eaw_imm16,CR16            is eaw_imm16;        opcode=17 & CR16                { CR16 = eaw_imm16; }
+
+# CLR   <EAd>              Clear
+#       N: 0
+#       Z: 1
+#       V: 0
+#       C: 0
+:clr.b        eab_direct                is eab_direct;         opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eab_direct[0,8] = 0; }
+:clr.b        eab_indirect              is eab_indirect;       opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eab_indirect = 0; }
+:clr.b        eab_disp8                 is eab_disp8;          opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eab_disp8 = 0; }
+:clr.b        eab_disp16                is eab_disp16;         opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eab_disp16 = 0; }
+:clr.b        eab_predec                is eab_predec;         opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eab_predec = 0; }
+:clr.b        eab_postinc               is eab_postinc;        opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eab_postinc = 0; }
+:clr.b        eab_abs8_br               is eab_abs8_br;        opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eab_abs8_br = 0; }
+:clr.b        eab_abs16          is eab_abs16;   opcode_special=0x13 [targetBase = 0;] { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eab_abs16 = 0; }
+:clr.w        eaw_direct                is eaw_direct;         opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eaw_direct = 0; }
+:clr.w        eaw_indirect              is eaw_indirect;       opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eaw_indirect = 0; }
+:clr.w        eaw_disp8                 is eaw_disp8;          opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eaw_disp8 = 0; }
+:clr.w        eaw_disp16                is eaw_disp16;         opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eaw_disp16 = 0; }
+:clr.w        eaw_predec                is eaw_predec;         opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eaw_predec = 0; }
+:clr.w        eaw_postinc               is eaw_postinc;        opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eaw_postinc = 0; }
+:clr.w        eaw_abs8_br               is eaw_abs8_br;        opcode_special=0x13                   { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eaw_abs8_br = 0; }
+:clr.w        eaw_abs16          is eaw_abs16;   opcode_special=0x13 [targetBase = 0;] { $(NF) = 0; $(ZF) = 1; $(VF) = 0; $(CF) = 0; eaw_abs16 = 0; }
+
+# NEG   <EAd>              Negate
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow. I think this can only occur for 0x80 or 0x8000. e.g., 0x80 = -128. 0 - (-128) = +128, which cannot be represented as a signed 8-bit value and remains as -128.
+#       C: "set to '1' if a borrow occurs; otherwise cleared to '0.'" I don't know how this can happen though. I'mma just use sborrow, maybe that'll compute correctly?
+:neg.b        eab_direct               is eab_direct;              opcode_special=0x14                { tmp = eab_direct[0,8];   $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x80  ;  eab_direct[0,8] = tmp; }
+:neg.b        eab_indirect               is eab_indirect;          opcode_special=0x14                { tmp = eab_indirect;      $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x80  ;  eab_indirect = tmp; }
+:neg.b        eab_disp8               is eab_disp8;                opcode_special=0x14                { tmp = eab_disp8;         $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x80  ;  eab_disp8 = tmp; }
+:neg.b        eab_disp16               is eab_disp16;              opcode_special=0x14                { tmp = eab_disp16;        $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x80  ;  eab_disp16 = tmp; }
+:neg.b        eab_predec               is eab_predec;              opcode_special=0x14                { tmp = eab_predec;        $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x80  ;  eab_predec = tmp; }
+:neg.b        eab_postinc               is eab_postinc;            opcode_special=0x14                { tmp = eab_postinc;       $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x80  ;  eab_postinc = tmp; }
+:neg.b        eab_abs8_br               is eab_abs8_br;            opcode_special=0x14                { tmp = eab_abs8_br;       $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x80  ;  eab_abs8_br = tmp; }
+:neg.b        eab_abs16               is eab_abs16;  opcode_special=0x14 [targetBase=0;]{ tmp = eab_abs16;  $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x80  ;  eab_abs16 = tmp; }
+:neg.w        eaw_direct               is eaw_direct;              opcode_special=0x14                { tmp = eaw_direct;        $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x8000;  eaw_direct = tmp; }
+:neg.w        eaw_indirect               is eaw_indirect;          opcode_special=0x14                { tmp = eaw_indirect;      $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x8000;  eaw_indirect = tmp; }
+:neg.w        eaw_disp8               is eaw_disp8;                opcode_special=0x14                { tmp = eaw_disp8;         $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x8000;  eaw_disp8 = tmp; }
+:neg.w        eaw_disp16               is eaw_disp16;              opcode_special=0x14                { tmp = eaw_disp16;        $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x8000;  eaw_disp16 = tmp; }
+:neg.w        eaw_predec               is eaw_predec;              opcode_special=0x14                { tmp = eaw_predec;        $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x8000;  eaw_predec = tmp; }
+:neg.w        eaw_postinc               is eaw_postinc;            opcode_special=0x14                { tmp = eaw_postinc;       $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x8000;  eaw_postinc = tmp; }
+:neg.w        eaw_abs8_br               is eaw_abs8_br;            opcode_special=0x14                { tmp = eaw_abs8_br;       $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x8000;  eaw_abs8_br = tmp; }
+:neg.w        eaw_abs16               is eaw_abs16;  opcode_special=0x14 [targetBase=0;]{ tmp = eaw_abs16;  $(NF) = tmp s< 0; $(CF) = sborrow(0, -tmp); tmp = -tmp; $(ZF) = tmp == 0; $(VF) = tmp == 0x8000;  eaw_abs16 = tmp; }
+
+# TST   <EAd>              Test
+#       N: result s< 0
+#       Z: result == 0
+#       V: 0
+#       C: 0
+:tst.b        eab_direct               is eab_direct;  opcode_special=0x16 { tmp:1 = eab_direct[0,8]; stdflags(tmp); }
+:tst.b        eab_indirect               is eab_indirect;  opcode_special=0x16 { stdflags(eab_indirect); }
+:tst.b        eab_disp8               is eab_disp8;  opcode_special=0x16 { stdflags(eab_disp8); }
+:tst.b        eab_disp16               is eab_disp16;  opcode_special=0x16 { stdflags(eab_disp16); }
+:tst.b        eab_predec               is eab_predec;  opcode_special=0x16 { stdflags(eab_predec); }
+:tst.b        eab_postinc               is eab_postinc;  opcode_special=0x16 { stdflags(eab_postinc); }
+:tst.b        eab_abs8_br               is eab_abs8_br;  opcode_special=0x16 { stdflags(eab_abs8_br); }
+:tst.b        eab_abs16               is eab_abs16;  opcode_special=0x16 [targetBase=0;]{ stdflags(eab_abs16); }
+:tst.w        eaw_direct               is eaw_direct;  opcode_special=0x16 { stdflags(eaw_direct); }
+:tst.w        eaw_indirect               is eaw_indirect;  opcode_special=0x16 { stdflags(eaw_indirect); }
+:tst.w        eaw_disp8               is eaw_disp8;  opcode_special=0x16 { stdflags(eaw_disp8); }
+:tst.w        eaw_disp16               is eaw_disp16;  opcode_special=0x16 { stdflags(eaw_disp16); }
+:tst.w        eaw_predec               is eaw_predec;  opcode_special=0x16 { stdflags(eaw_predec); }
+:tst.w        eaw_postinc               is eaw_postinc;  opcode_special=0x16 { stdflags(eaw_postinc); }
+:tst.w        eaw_abs8_br               is eaw_abs8_br;  opcode_special=0x16 { stdflags(eaw_abs8_br); }
+:tst.w        eaw_abs16               is eaw_abs16;  opcode_special=0x16 [targetBase=0;]{ stdflags(eaw_abs16); }
+
+# CMP:G <EAs>,Rd           Compare, general format
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs
+#       C: unsigned borrow: result u> Rd_original
+:cmp:"g.b"    eab_direct,Rd            is eab_direct;   opcode=14 & Rd { tmp:1 = eab_direct:1; subflags(Rd:1, tmp); }
+:cmp:"g.b"    eab_indirect,Rd          is eab_indirect; opcode=14 & Rd { subflags(Rd:1, eab_indirect); }
+:cmp:"g.b"    eab_disp8,Rd             is eab_disp8;    opcode=14 & Rd { subflags(Rd:1, eab_disp8); }
+:cmp:"g.b"    eab_disp16,Rd            is eab_disp16;   opcode=14 & Rd { subflags(Rd:1, eab_disp16); }
+:cmp:"g.b"    eab_predec,Rd            is eab_predec;   opcode=14 & Rd { subflags(Rd:1, eab_predec); }
+:cmp:"g.b"    eab_postinc,Rd           is eab_postinc;  opcode=14 & Rd { subflags(Rd:1, eab_postinc); }
+:cmp:"g.b"    eab_abs8_br,Rd           is eab_abs8_br;  opcode=14 & Rd { subflags(Rd:1, eab_abs8_br); }
+:cmp:"g.b"    eab_abs16,Rd             is eab_abs16;    opcode=14 & Rd { subflags(Rd:1, eab_abs16); }
+:cmp:"g.b"    eab_imm8,Rd              is eab_imm8;     opcode=14 & Rd { subflags(Rd:1, eab_imm8); }
+:cmp:"g.w"    eaw_direct,Rd            is eaw_direct;   opcode=14 & Rd { subflags(Rd, eaw_direct); }
+:cmp:"g.w"    eaw_indirect,Rd          is eaw_indirect; opcode=14 & Rd { subflags(Rd, eaw_indirect); }
+:cmp:"g.w"    eaw_disp8,Rd             is eaw_disp8;    opcode=14 & Rd { subflags(Rd, eaw_disp8); }
+:cmp:"g.w"    eaw_disp16,Rd            is eaw_disp16;   opcode=14 & Rd { subflags(Rd, eaw_disp16); }
+:cmp:"g.w"    eaw_predec,Rd            is eaw_predec;   opcode=14 & Rd { subflags(Rd, eaw_predec); }
+:cmp:"g.w"    eaw_postinc,Rd           is eaw_postinc;  opcode=14 & Rd { subflags(Rd, eaw_postinc); }
+:cmp:"g.w"    eaw_abs8_br,Rd           is eaw_abs8_br;  opcode=14 & Rd { subflags(Rd, eaw_abs8_br); }
+:cmp:"g.w"    eaw_abs16,Rd             is eaw_abs16;    opcode=14 & Rd { subflags(Rd, eaw_abs16); }
+:cmp:"g.b"    eaw_imm16,Rd             is eaw_imm16;    opcode=14 & Rd { subflags(Rd, eaw_imm16); }
+
+# CMP:G #xx,<EAd>          Compare, general format
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs
+#       C: unsigned borrow: result u> Rd_original
+:cmp:"g.b"    i8,eab_direct            is eab_direct;    opcode_special=4; i8  { tmp:1 = eab_direct:1; subflags(tmp, i8); }
+:cmp:"g.b"    i8,eab_indirect          is eab_indirect;  opcode_special=4; i8  { subflags(eab_indirect, i8); }
+:cmp:"g.b"    i8,eab_disp8             is eab_disp8;     opcode_special=4; i8  { subflags(eab_disp8, i8); }
+:cmp:"g.b"    i8,eab_disp16            is eab_disp16;    opcode_special=4; i8  { subflags(eab_disp16, i8); }
+:cmp:"g.b"    i8,eab_predec            is eab_predec;    opcode_special=4; i8  { subflags(eab_predec, i8); }
+:cmp:"g.b"    i8,eab_postinc           is eab_postinc;   opcode_special=4; i8  { subflags(eab_postinc, i8); }
+:cmp:"g.b"    i8,eab_abs8_br           is eab_abs8_br;   opcode_special=4; i8  { subflags(eab_abs8_br, i8); }
+:cmp:"g.b"    i8,eab_abs16             is eab_abs16;     opcode_special=4; i8  { subflags(eab_abs16, i8); }
+:cmp:"g.b"    i8,eab_imm8              is eab_imm8;      opcode_special=4; i8  { subflags(eab_imm8, i8); }
+:cmp:"g.w"    i16,eaw_direct           is eaw_direct;    opcode_special=5; i16 { subflags(eaw_direct, i16); }
+:cmp:"g.w"    i16,eaw_indirect         is eaw_indirect;  opcode_special=5; i16 { subflags(eaw_indirect, i16); }
+:cmp:"g.w"    i16,eaw_disp8            is eaw_disp8;     opcode_special=5; i16 { subflags(eaw_disp8, i16); }
+:cmp:"g.w"    i16,eaw_disp16           is eaw_disp16;    opcode_special=5; i16 { subflags(eaw_disp16, i16); }
+:cmp:"g.w"    i16,eaw_predec           is eaw_predec;    opcode_special=5; i16 { subflags(eaw_predec, i16); }
+:cmp:"g.w"    i16,eaw_postinc          is eaw_postinc;   opcode_special=5; i16 { subflags(eaw_postinc, i16); }
+:cmp:"g.w"    i16,eaw_abs8_br          is eaw_abs8_br;   opcode_special=5; i16 { subflags(eaw_abs8_br, i16); }
+:cmp:"g.w"    i16,eaw_abs16            is eaw_abs16;     opcode_special=5; i16 { subflags(eaw_abs16, i16); }
+:cmp:"g.b"    i16,eaw_imm16            is eaw_imm16;     opcode_special=5; i16 { subflags(eaw_imm16, i16); }
+
+# CMP:E #xx:8,Rd           Compare:E, short format
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs
+#       C: unsigned borrow: result u> Rd_original
+:cmp:"e"      i8,Rd                       is opcode=8 & Rd; i8  { subflags(i8,  Rd:1); }
+
+# CMP:I #xx:8,Rd           Compare:I, short format
+#       N: result s< 0
+#       Z: result == 0
+#       V: signed overflow: signed computed result is not the same as the mathematical result assuming signed inputs
+#       C: unsigned borrow: result u> Rd_original
+:cmp:"i"      i16,Rd                      is opcode=9 & Rd; i16 { subflags(Rd, i16); }
+
+# EXTU  Rd                 Extend as unsigned
+#       N: 0
+#       Z: result == 0
+#       V: 0
+#       C: 0
+:extu.b       Rn                          is mode=10 & sz = 0 & Rn; opcode_special=0x12 { Rn = zext(Rn[0,8]); $(NF) = 0; $(ZF) = Rn == 0; $(VF) = 0; $(CF) = 0; }
+
+# EXTS  Rd                 Extend as signed
+#       N: result s< 0
+#       Z: result == 0
+#       V: 0
+#       C: 0
+:exts.b       Rn                          is mode=10 & sz = 0 & Rn; opcode_special=0x11 { Rn = sext(Rn[0,8]); $(NF) = Rn s< 0; $(ZF) = Rn == 0; $(VF) = 0; $(CF) = 0; }
+
+# SHAL  <EAd>              Shift arithmetic left
+#       N = res < 0
+#       Z = res == 0
+#       V = MSB(res) != MSB(orig)
+#       C = MSB(orig)
+:shal.b       eab_direct                  is eab_direct; opcode_special=0x18 { orig:1 = eab_direct[0,8]; res = orig<<1; eab_direct[0,8] = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[7,1] != orig[7,1]; $(CF) = orig[7,1]; }
+:shal.b       eab_indirect                  is eab_indirect; opcode_special=0x18 { orig:1 = eab_indirect; res = orig<<1; eab_indirect = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[7,1] != orig[7,1]; $(CF) = orig[7,1]; }
+:shal.b       eab_disp8                  is eab_disp8; opcode_special=0x18 { orig:1 = eab_disp8; res = orig<<1; eab_disp8 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[7,1] != orig[7,1]; $(CF) = orig[7,1]; }
+:shal.b       eab_disp16                  is eab_disp16; opcode_special=0x18 { orig:1 = eab_disp16; res = orig<<1; eab_disp16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[7,1] != orig[7,1]; $(CF) = orig[7,1]; }
+:shal.b       eab_predec                  is eab_predec; opcode_special=0x18 { orig:1 = eab_predec; res = orig<<1; eab_predec = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[7,1] != orig[7,1]; $(CF) = orig[7,1]; }
+:shal.b       eab_postinc                  is eab_postinc; opcode_special=0x18 { orig:1 = eab_postinc; res = orig<<1; eab_postinc = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[7,1] != orig[7,1]; $(CF) = orig[7,1]; }
+:shal.b       eab_abs8_br                  is eab_abs8_br; opcode_special=0x18 { orig:1 = eab_abs8_br; res = orig<<1; eab_abs8_br = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[7,1] != orig[7,1]; $(CF) = orig[7,1]; }
+:shal.b       eab_abs16                  is eab_abs16; opcode_special=0x18 [targetBase=0;]{ orig:1 = eab_abs16; res = orig<<1; eab_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[7,1] != orig[7,1]; $(CF) = orig[7,1]; }
+:shal.w       eaw_direct                  is eaw_direct; opcode_special=0x18 { orig:2 = eaw_direct; res = orig<<1; eaw_direct = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[15,1] != orig[15,1]; $(CF) = orig[15,1]; }
+:shal.w       eaw_indirect                  is eaw_indirect; opcode_special=0x18 { orig:2 = eaw_indirect; res = orig<<1; eaw_indirect = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[15,1] != orig[15,1]; $(CF) = orig[15,1]; }
+:shal.w       eaw_disp8                  is eaw_disp8; opcode_special=0x18 { orig:2 = eaw_disp8; res = orig<<1; eaw_disp8 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[15,1] != orig[15,1]; $(CF) = orig[15,1]; }
+:shal.w       eaw_disp16                  is eaw_disp16; opcode_special=0x18 { orig:2 = eaw_disp16; res = orig<<1; eaw_disp16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[15,1] != orig[15,1]; $(CF) = orig[15,1]; }
+:shal.w       eaw_predec                  is eaw_predec; opcode_special=0x18 { orig:2 = eaw_predec; res = orig<<1; eaw_predec = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[15,1] != orig[15,1]; $(CF) = orig[15,1]; }
+:shal.w       eaw_postinc                  is eaw_postinc; opcode_special=0x18 { orig:2 = eaw_postinc; res = orig<<1; eaw_postinc = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[15,1] != orig[15,1]; $(CF) = orig[15,1]; }
+:shal.w       eaw_abs8_br                  is eaw_abs8_br; opcode_special=0x18 { orig:2 = eaw_abs8_br; res = orig<<1; eaw_abs8_br = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[15,1] != orig[15,1]; $(CF) = orig[15,1]; }
+:shal.w       eaw_abs16                  is eaw_abs16; opcode_special=0x18 [targetBase=0;]{ orig:2 = eaw_abs16; res = orig<<1; eaw_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = res[15,1] != orig[15,1]; $(CF) = orig[15,1]; }
+
+# SHLL  <EAd>              Shift logical left
+#       N = res < 0
+#       Z = res == 0
+#       V = 0
+#       C = MSB(orig)
+:shll.b       eab_direct                  is eab_direct; opcode_special=0x1a { orig:1 = eab_direct[0,8]; res = orig<<1; eab_direct[0,8] = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:shll.b       eab_indirect                  is eab_indirect; opcode_special=0x1a { orig:1 = eab_indirect; res = orig<<1; eab_indirect = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:shll.b       eab_disp8                  is eab_disp8; opcode_special=0x1a { orig:1 = eab_disp8; res = orig<<1; eab_disp8 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:shll.b       eab_disp16                  is eab_disp16; opcode_special=0x1a { orig:1 = eab_disp16; res = orig<<1; eab_disp16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:shll.b       eab_predec                  is eab_predec; opcode_special=0x1a { orig:1 = eab_predec; res = orig<<1; eab_predec = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:shll.b       eab_postinc                  is eab_postinc; opcode_special=0x1a { orig:1 = eab_postinc; res = orig<<1; eab_postinc = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:shll.b       eab_abs8_br                  is eab_abs8_br; opcode_special=0x1a { orig:1 = eab_abs8_br; res = orig<<1; eab_abs8_br = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:shll.b       eab_abs16                  is eab_abs16; opcode_special=0x1a [targetBase=0;]{ orig:1 = eab_abs16; res = orig<<1; eab_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:shll.w       eaw_direct                  is eaw_direct; opcode_special=0x1a { orig:2 = eaw_direct; res = orig<<1; eaw_direct = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:shll.w       eaw_indirect                  is eaw_indirect; opcode_special=0x1a { orig:2 = eaw_indirect; res = orig<<1; eaw_indirect = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:shll.w       eaw_disp8                  is eaw_disp8; opcode_special=0x1a { orig:2 = eaw_disp8; res = orig<<1; eaw_disp8 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:shll.w       eaw_disp16                  is eaw_disp16; opcode_special=0x1a { orig:2 = eaw_disp16; res = orig<<1; eaw_disp16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:shll.w       eaw_predec                  is eaw_predec; opcode_special=0x1a { orig:2 = eaw_predec; res = orig<<1; eaw_predec = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:shll.w       eaw_postinc                  is eaw_postinc; opcode_special=0x1a { orig:2 = eaw_postinc; res = orig<<1; eaw_postinc = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:shll.w       eaw_abs8_br                  is eaw_abs8_br; opcode_special=0x1a { orig:2 = eaw_abs8_br; res = orig<<1; eaw_abs8_br = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:shll.w       eaw_abs16                  is eaw_abs16; opcode_special=0x1a [targetBase=0;]{ orig:2 = eaw_abs16; res = orig<<1; eaw_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+
+# SHAR  <EAd>              Shift arithmetic right
+#       N = res < 0
+#       Z = res == 0
+#       V = 0
+#       C = orig[0]
+:shar.b       eab_direct                    is eab_direct; opcode_special=0x19 { orig:1 = eab_direct:1; res = orig s>> 1; eab_direct[0,8] = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.b       eab_indirect                  is eab_indirect; opcode_special=0x19 { orig:1 = eab_indirect; res = orig s>> 1; eab_indirect = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.b       eab_disp8                     is eab_disp8; opcode_special=0x19 { orig:1 = eab_disp8; res = orig s>> 1; eab_disp8 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.b       eab_disp16                    is eab_disp16; opcode_special=0x19 { orig:1 = eab_disp16; res = orig s>> 1; eab_disp16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.b       eab_predec                    is eab_predec; opcode_special=0x19 { orig:1 = eab_predec; res = orig s>> 1; eab_predec = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.b       eab_postinc                   is eab_postinc; opcode_special=0x19 { orig:1 = eab_postinc; res = orig s>> 1; eab_postinc = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.b       eab_abs8_br                   is eab_abs8_br; opcode_special=0x19 { orig:1 = eab_abs8_br; res = orig s>> 1; eab_abs8_br = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.b       eab_abs16              is eab_abs16; opcode_special=0x19 [targetBase=0;]{ orig:1 = eab_abs16; res = orig s>> 1; eab_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.w       eaw_direct                    is eaw_direct; opcode_special=0x19 { orig:2 = eaw_direct; res = orig s>> 1; eaw_direct = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.w       eaw_indirect                  is eaw_indirect; opcode_special=0x19 { orig:2 = eaw_indirect; res = orig s>> 1; eaw_indirect = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.w       eaw_disp8                     is eaw_disp8; opcode_special=0x19 { orig:2 = eaw_disp8; res = orig s>> 1; eaw_disp8 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.w       eaw_disp16                    is eaw_disp16; opcode_special=0x19 { orig:2 = eaw_disp16; res = orig s>> 1; eaw_disp16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.w       eaw_predec                    is eaw_predec; opcode_special=0x19 { orig:2 = eaw_predec; res = orig s>> 1; eaw_predec = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.w       eaw_postinc                   is eaw_postinc; opcode_special=0x19 { orig:2 = eaw_postinc; res = orig s>> 1; eaw_postinc = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.w       eaw_abs8_br                   is eaw_abs8_br; opcode_special=0x19 { orig:2 = eaw_abs8_br; res = orig s>> 1; eaw_abs8_br = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shar.w       eaw_abs16              is eaw_abs16; opcode_special=0x19 [targetBase=0;]{ orig:2 = eaw_abs16; res = orig s>> 1; eaw_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+
+# SHLR  <EAd>              Shift logical right
+#       N = res < 0
+#       Z = res == 0
+#       V = 0
+#       C = orig[0]
+:shlr.b       eab_direct                  is eab_direct; opcode_special=0x1b { orig:1 = eab_direct[0,8]; res = orig >> 1; eab_direct[0,8] = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.b       eab_indirect                  is eab_indirect; opcode_special=0x1b { orig:1 = eab_indirect; res = orig >> 1; eab_indirect = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.b       eab_disp8                  is eab_disp8; opcode_special=0x1b { orig:1 = eab_disp8; res = orig >> 1; eab_disp8 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.b       eab_disp16                  is eab_disp16; opcode_special=0x1b { orig:1 = eab_disp16; res = orig >> 1; eab_disp16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.b       eab_predec                  is eab_predec; opcode_special=0x1b { orig:1 = eab_predec; res = orig >> 1; eab_predec = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.b       eab_postinc                  is eab_postinc; opcode_special=0x1b { orig:1 = eab_postinc; res = orig >> 1; eab_postinc = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.b       eab_abs8_br                  is eab_abs8_br; opcode_special=0x1b { orig:1 = eab_abs8_br; res = orig >> 1; eab_abs8_br = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.b       eab_abs16                  is eab_abs16; opcode_special=0x1b [targetBase=0;]{ orig:1 = eab_abs16; res = orig >> 1; eab_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.w       eaw_direct                  is eaw_direct; opcode_special=0x1b { orig:2 = eaw_direct; res = orig >> 1; eaw_direct = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.w       eaw_indirect                  is eaw_indirect; opcode_special=0x1b { orig:2 = eaw_indirect; res = orig >> 1; eaw_indirect = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.w       eaw_disp8                  is eaw_disp8; opcode_special=0x1b { orig:2 = eaw_disp8; res = orig >> 1; eaw_disp8 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.w       eaw_disp16                  is eaw_disp16; opcode_special=0x1b { orig:2 = eaw_disp16; res = orig >> 1; eaw_disp16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.w       eaw_predec                  is eaw_predec; opcode_special=0x1b { orig:2 = eaw_predec; res = orig >> 1; eaw_predec = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.w       eaw_postinc                  is eaw_postinc; opcode_special=0x1b { orig:2 = eaw_postinc; res = orig >> 1; eaw_postinc = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.w       eaw_abs8_br                  is eaw_abs8_br; opcode_special=0x1b { orig:2 = eaw_abs8_br; res = orig >> 1; eaw_abs8_br = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:shlr.w       eaw_abs16                  is eaw_abs16; opcode_special=0x1b [targetBase=0;]{ orig:2 = eaw_abs16; res = orig >> 1; eaw_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+
+# ROTL  <EAd>              Rotate left
+#       N = res < 0
+#       Z = res == 0
+#       V = 0
+#       C = MSB(orig)
+:rotl.b       eab_direct          is eab_direct;       opcode_special=0x1c                { orig:1 = eab_direct[0,8];  res = orig << 1 | orig[7,1];        eab_direct[0,8] = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:rotl.b       eab_indirect        is eab_indirect;     opcode_special=0x1c                { orig:1 = eab_indirect;     res = orig << 1 | orig[7,1];        eab_indirect    = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:rotl.b       eab_disp8           is eab_disp8;        opcode_special=0x1c                { orig:1 = eab_disp8;        res = orig << 1 | orig[7,1];        eab_disp8       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:rotl.b       eab_disp16          is eab_disp16;       opcode_special=0x1c                { orig:1 = eab_disp16;       res = orig << 1 | orig[7,1];        eab_disp16      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:rotl.b       eab_predec          is eab_predec;       opcode_special=0x1c                { orig:1 = eab_predec;       res = orig << 1 | orig[7,1];        eab_predec      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:rotl.b       eab_postinc         is eab_postinc;      opcode_special=0x1c                { orig:1 = eab_postinc;      res = orig << 1 | orig[7,1];        eab_postinc     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:rotl.b       eab_abs8_br         is eab_abs8_br;      opcode_special=0x1c                { orig:1 = eab_abs8_br;      res = orig << 1 | orig[7,1];        eab_abs8_br     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:rotl.b       eab_abs16    is eab_abs16; opcode_special=0x1c [targetBase=0;]{ orig:1 = eab_abs16; res = orig << 1 | orig[7,1];        eab_abs16= res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[7,1]; }
+:rotl.w       eaw_direct          is eaw_direct;       opcode_special=0x1c                { orig:2 = eaw_direct;       res = orig << 1 | zext(orig[15,1]); eaw_direct      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:rotl.w       eaw_indirect        is eaw_indirect;     opcode_special=0x1c                { orig:2 = eaw_indirect;     res = orig << 1 | zext(orig[15,1]); eaw_indirect    = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:rotl.w       eaw_disp8           is eaw_disp8;        opcode_special=0x1c                { orig:2 = eaw_disp8;        res = orig << 1 | zext(orig[15,1]); eaw_disp8       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:rotl.w       eaw_disp16          is eaw_disp16;       opcode_special=0x1c                { orig:2 = eaw_disp16;       res = orig << 1 | zext(orig[15,1]); eaw_disp16      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:rotl.w       eaw_predec          is eaw_predec;       opcode_special=0x1c                { orig:2 = eaw_predec;       res = orig << 1 | zext(orig[15,1]); eaw_predec      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:rotl.w       eaw_postinc         is eaw_postinc;      opcode_special=0x1c                { orig:2 = eaw_postinc;      res = orig << 1 | zext(orig[15,1]); eaw_postinc     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:rotl.w       eaw_abs8_br         is eaw_abs8_br;      opcode_special=0x1c                { orig:2 = eaw_abs8_br;      res = orig << 1 | zext(orig[15,1]); eaw_abs8_br     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+:rotl.w       eaw_abs16    is eaw_abs16; opcode_special=0x1c [targetBase=0;]{ orig:2 = eaw_abs16; res = orig << 1 | zext(orig[15,1]); eaw_abs16= res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[15,1]; }
+
+# ROTR  <EAd>              Rotate right
+#       N = res < 0
+#       Z = res == 0
+#       V = 0
+#       C = orig[0]
+:rotr.b       eab_direct          is eab_direct;       opcode_special=0x1d                { orig:1 = eab_direct[0,8];  res = (orig >> 1) | ((orig & 1) << 7); eab_direct[0,8] = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.b       eab_indirect        is eab_indirect;     opcode_special=0x1d                { orig:1 = eab_indirect;     res = (orig >> 1) | ((orig & 1) << 7); eab_indirect    = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.b       eab_disp8           is eab_disp8;        opcode_special=0x1d                { orig:1 = eab_disp8;        res = (orig >> 1) | ((orig & 1) << 7); eab_disp8       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.b       eab_disp16          is eab_disp16;       opcode_special=0x1d                { orig:1 = eab_disp16;       res = (orig >> 1) | ((orig & 1) << 7); eab_disp16      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.b       eab_predec          is eab_predec;       opcode_special=0x1d                { orig:1 = eab_predec;       res = (orig >> 1) | ((orig & 1) << 7); eab_predec      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.b       eab_postinc         is eab_postinc;      opcode_special=0x1d                { orig:1 = eab_postinc;      res = (orig >> 1) | ((orig & 1) << 7); eab_postinc     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.b       eab_abs8_br         is eab_abs8_br;      opcode_special=0x1d                { orig:1 = eab_abs8_br;      res = (orig >> 1) | ((orig & 1) << 7); eab_abs8_br     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.b       eab_abs16    is eab_abs16; opcode_special=0x1d [targetBase=0;]{ orig:1 = eab_abs16; res = (orig >> 1) | ((orig & 1) << 7); eab_abs16= res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.w       eaw_direct          is eaw_direct;       opcode_special=0x1d                { orig:2 = eaw_direct;       res = (orig >> 1) | ((orig & 1) << 15);eaw_direct      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.w       eaw_indirect        is eaw_indirect;     opcode_special=0x1d                { orig:2 = eaw_indirect;     res = (orig >> 1) | ((orig & 1) << 15);eaw_indirect    = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.w       eaw_disp8           is eaw_disp8;        opcode_special=0x1d                { orig:2 = eaw_disp8;        res = (orig >> 1) | ((orig & 1) << 15);eaw_disp8       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.w       eaw_disp16          is eaw_disp16;       opcode_special=0x1d                { orig:2 = eaw_disp16;       res = (orig >> 1) | ((orig & 1) << 15);eaw_disp16      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.w       eaw_predec          is eaw_predec;       opcode_special=0x1d                { orig:2 = eaw_predec;       res = (orig >> 1) | ((orig & 1) << 15);eaw_predec      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.w       eaw_postinc         is eaw_postinc;      opcode_special=0x1d                { orig:2 = eaw_postinc;      res = (orig >> 1) | ((orig & 1) << 15);eaw_postinc     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.w       eaw_abs8_br         is eaw_abs8_br;      opcode_special=0x1d                { orig:2 = eaw_abs8_br;      res = (orig >> 1) | ((orig & 1) << 15);eaw_abs8_br     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotr.w       eaw_abs16    is eaw_abs16; opcode_special=0x1d [targetBase=0;]{ orig:2 = eaw_abs16; res = (orig >> 1) | ((orig & 1) << 15);eaw_abs16= res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+
+# ROTXL <EAd>              Rotate with extend carry left
+#       N = res < 0
+#       Z = res == 0
+#       V = 0
+#       C = MSB(orig)
+:rotxl.b      eab_direct          is eab_direct;       opcode_special=0x1e                { orig:1 = eab_direct[0,8];  res:1 = orig << 1 | $(CF);       eab_direct[0,8]  = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.b      eab_indirect        is eab_indirect;     opcode_special=0x1e                { orig:1 = eab_indirect;     res:1 = orig << 1 | $(CF);       eab_indirect     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.b      eab_disp8           is eab_disp8;        opcode_special=0x1e                { orig:1 = eab_disp8;        res:1 = orig << 1 | $(CF);       eab_disp8        = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.b      eab_disp16          is eab_disp16;       opcode_special=0x1e                { orig:1 = eab_disp16;       res:1 = orig << 1 | $(CF);       eab_disp16       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.b      eab_predec          is eab_predec;       opcode_special=0x1e                { orig:1 = eab_predec;       res:1 = orig << 1 | $(CF);       eab_predec       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.b      eab_postinc         is eab_postinc;      opcode_special=0x1e                { orig:1 = eab_postinc;      res:1 = orig << 1 | $(CF);       eab_postinc      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.b      eab_abs8_br         is eab_abs8_br;      opcode_special=0x1e                { orig:1 = eab_abs8_br;      res:1 = orig << 1 | $(CF);       eab_abs8_br      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.b      eab_abs16    is eab_abs16; opcode_special=0x1e [targetBase=0;]{ orig:1 = eab_abs16; res:1 = orig << 1 | $(CF);       eab_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.w      eaw_direct          is eaw_direct;       opcode_special=0x1e                { orig:2 = eaw_direct;       res:2 = orig << 1 | zext($(CF)); eaw_direct       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.w      eaw_indirect        is eaw_indirect;     opcode_special=0x1e                { orig:2 = eaw_indirect;     res:2 = orig << 1 | zext($(CF)); eaw_indirect     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.w      eaw_disp8           is eaw_disp8;        opcode_special=0x1e                { orig:2 = eaw_disp8;        res:2 = orig << 1 | zext($(CF)); eaw_disp8        = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.w      eaw_disp16          is eaw_disp16;       opcode_special=0x1e                { orig:2 = eaw_disp16;       res:2 = orig << 1 | zext($(CF)); eaw_disp16       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.w      eaw_predec          is eaw_predec;       opcode_special=0x1e                { orig:2 = eaw_predec;       res:2 = orig << 1 | zext($(CF)); eaw_predec       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.w      eaw_postinc         is eaw_postinc;      opcode_special=0x1e                { orig:2 = eaw_postinc;      res:2 = orig << 1 | zext($(CF)); eaw_postinc      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.w      eaw_abs8_br         is eaw_abs8_br;      opcode_special=0x1e                { orig:2 = eaw_abs8_br;      res:2 = orig << 1 | zext($(CF)); eaw_abs8_br      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+:rotxl.w      eaw_abs16    is eaw_abs16; opcode_special=0x1e [targetBase=0;]{ orig:2 = eaw_abs16; res:2 = orig << 1 | zext($(CF)); eaw_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig s< 0; }
+
+# ROTXR <EAd>              Rotate with extend carry right
+#       N = res < 0
+#       Z = res == 0
+#       V = 0
+#       C = orig[0]
+:rotxr.b      eab_direct          is eab_direct;       opcode_special=0x1f                { orig:1 = eab_direct[0,8];  res = (orig >> 1) | ($(CF) << 7);        eab_direct[0,8]  = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.b      eab_indirect        is eab_indirect;     opcode_special=0x1f                { orig:1 = eab_indirect;     res = (orig >> 1) | ($(CF) << 7);        eab_indirect     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.b      eab_disp8           is eab_disp8;        opcode_special=0x1f                { orig:1 = eab_disp8;        res = (orig >> 1) | ($(CF) << 7);        eab_disp8        = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.b      eab_disp16          is eab_disp16;       opcode_special=0x1f                { orig:1 = eab_disp16;       res = (orig >> 1) | ($(CF) << 7);        eab_disp16       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.b      eab_predec          is eab_predec;       opcode_special=0x1f                { orig:1 = eab_predec;       res = (orig >> 1) | ($(CF) << 7);        eab_predec       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.b      eab_postinc         is eab_postinc;      opcode_special=0x1f                { orig:1 = eab_postinc;      res = (orig >> 1) | ($(CF) << 7);        eab_postinc      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.b      eab_abs8_br         is eab_abs8_br;      opcode_special=0x1f                { orig:1 = eab_abs8_br;      res = (orig >> 1) | ($(CF) << 7);        eab_abs8_br      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.b      eab_abs16    is eab_abs16; opcode_special=0x1f [targetBase=0;]{ orig:1 = eab_abs16; res = (orig >> 1) | ($(CF) << 7);        eab_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.w      eaw_direct          is eaw_direct;       opcode_special=0x1f                { orig:2 = eaw_direct;       res = (orig >> 1) | (zext($(CF)) << 15); eaw_direct       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.w      eaw_indirect        is eaw_indirect;     opcode_special=0x1f                { orig:2 = eaw_indirect;     res = (orig >> 1) | (zext($(CF)) << 15); eaw_indirect     = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.w      eaw_disp8           is eaw_disp8;        opcode_special=0x1f                { orig:2 = eaw_disp8;        res = (orig >> 1) | (zext($(CF)) << 15); eaw_disp8        = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.w      eaw_disp16          is eaw_disp16;       opcode_special=0x1f                { orig:2 = eaw_disp16;       res = (orig >> 1) | (zext($(CF)) << 15); eaw_disp16       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.w      eaw_predec          is eaw_predec;       opcode_special=0x1f                { orig:2 = eaw_predec;       res = (orig >> 1) | (zext($(CF)) << 15); eaw_predec       = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.w      eaw_postinc         is eaw_postinc;      opcode_special=0x1f                { orig:2 = eaw_postinc;      res = (orig >> 1) | (zext($(CF)) << 15); eaw_postinc      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.w      eaw_abs8_br         is eaw_abs8_br;      opcode_special=0x1f                { orig:2 = eaw_abs8_br;      res = (orig >> 1) | (zext($(CF)) << 15); eaw_abs8_br      = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+:rotxr.w      eaw_abs16    is eaw_abs16; opcode_special=0x1f [targetBase=0;]{ orig:2 = eaw_abs16; res = (orig >> 1) | (zext($(CF)) << 15); eaw_abs16 = res; $(NF) = res s< 0; $(ZF) = res == 0; $(VF) = 0; $(CF) = orig[0,1]; }
+
+# AND   <EAs>,Rd           AND logical
+#       N = MSB(res)
+#       Z = res == 0
+#       V = 0
+#       C = unchanged
+:and.b        eab_direct      ,Rd    is eab_direct;       opcode=10 & Rd                 { result:1 = eab_direct[0,8]  & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.b        eab_indirect    ,Rd    is eab_indirect;     opcode=10 & Rd                 { result:1 = eab_indirect     & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.b        eab_disp8       ,Rd    is eab_disp8;        opcode=10 & Rd                 { result:1 = eab_disp8        & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.b        eab_disp16      ,Rd    is eab_disp16;       opcode=10 & Rd                 { result:1 = eab_disp16       & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.b        eab_predec      ,Rd    is eab_predec;       opcode=10 & Rd                 { result:1 = eab_predec       & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.b        eab_postinc     ,Rd    is eab_postinc;      opcode=10 & Rd                 { result:1 = eab_postinc      & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.b        eab_abs8_br     ,Rd    is eab_abs8_br;      opcode=10 & Rd                 { result:1 = eab_abs8_br      & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.b        eab_abs16       ,Rd    is eab_abs16;        opcode=10 & Rd [targetBase=Rd;]{ result:1 = eab_abs16        & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.b        eab_imm8        ,Rd    is eab_imm8   ;      opcode=10 & Rd                 { result:1 = eab_imm8         & Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:and.w        eaw_direct      ,Rd    is eaw_direct;       opcode=10 & Rd                 { result:2 = eaw_direct       & Rd     ; Rd      = result; stdflags(result); }
+:and.w        eaw_indirect    ,Rd    is eaw_indirect;     opcode=10 & Rd                 { result:2 = eaw_indirect     & Rd     ; Rd      = result; stdflags(result); }
+:and.w        eaw_disp8       ,Rd    is eaw_disp8;        opcode=10 & Rd                 { result:2 = eaw_disp8        & Rd     ; Rd      = result; stdflags(result); }
+:and.w        eaw_disp16      ,Rd    is eaw_disp16;       opcode=10 & Rd                 { result:2 = eaw_disp16       & Rd     ; Rd      = result; stdflags(result); }
+:and.w        eaw_predec      ,Rd    is eaw_predec;       opcode=10 & Rd                 { result:2 = eaw_predec       & Rd     ; Rd      = result; stdflags(result); }
+:and.w        eaw_postinc     ,Rd    is eaw_postinc;      opcode=10 & Rd                 { result:2 = eaw_postinc      & Rd     ; Rd      = result; stdflags(result); }
+:and.w        eaw_abs8_br     ,Rd    is eaw_abs8_br;      opcode=10 & Rd                 { result:2 = eaw_abs8_br      & Rd     ; Rd      = result; stdflags(result); }
+:and.w        eaw_abs16,Rd           is eaw_abs16;        opcode=10 & Rd [targetBase=Rd;]{ result:2 = eaw_abs16        & Rd     ; Rd      = result; stdflags(result); }
+:and.w        eaw_imm16       ,Rd    is eaw_imm16  ;      opcode=10 & Rd                 { result:2 = eaw_imm16        & Rd     ; Rd      = result; stdflags(result); }
+
+# OR    <EAs>,Rd           Or logical
+#       N = MSB(res)
+#       Z = res == 0
+#       V = 0
+#       C = unchanged
+:or.b         eab_direct      ,Rd    is eab_direct;       opcode=8  & Rd                 { result:1 = eab_direct[0,8]  | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.b         eab_indirect    ,Rd    is eab_indirect;     opcode=8  & Rd                 { result:1 = eab_indirect     | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.b         eab_disp8       ,Rd    is eab_disp8;        opcode=8  & Rd                 { result:1 = eab_disp8        | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.b         eab_disp16      ,Rd    is eab_disp16;       opcode=8  & Rd                 { result:1 = eab_disp16       | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.b         eab_predec      ,Rd    is eab_predec;       opcode=8  & Rd                 { result:1 = eab_predec       | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.b         eab_postinc     ,Rd    is eab_postinc;      opcode=8  & Rd                 { result:1 = eab_postinc      | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.b         eab_abs8_br     ,Rd    is eab_abs8_br;      opcode=8  & Rd                 { result:1 = eab_abs8_br      | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.b         eab_abs16,Rd           is eab_abs16;        opcode=8  & Rd [targetBase=Rd;]{ result:1 = eab_abs16        | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.b         eab_imm8        ,Rd    is eab_imm8   ;      opcode=8  & Rd                 { result:1 = eab_imm8         | Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:or.w         eaw_direct      ,Rd    is eaw_direct;       opcode=8  & Rd                 { result:2 = eaw_direct       | Rd     ; Rd      = result; stdflags(result); }
+:or.w         eaw_indirect    ,Rd    is eaw_indirect;     opcode=8  & Rd                 { result:2 = eaw_indirect     | Rd     ; Rd      = result; stdflags(result); }
+:or.w         eaw_disp8       ,Rd    is eaw_disp8;        opcode=8  & Rd                 { result:2 = eaw_disp8        | Rd     ; Rd      = result; stdflags(result); }
+:or.w         eaw_disp16      ,Rd    is eaw_disp16;       opcode=8  & Rd                 { result:2 = eaw_disp16       | Rd     ; Rd      = result; stdflags(result); }
+:or.w         eaw_predec      ,Rd    is eaw_predec;       opcode=8  & Rd                 { result:2 = eaw_predec       | Rd     ; Rd      = result; stdflags(result); }
+:or.w         eaw_postinc     ,Rd    is eaw_postinc;      opcode=8  & Rd                 { result:2 = eaw_postinc      | Rd     ; Rd      = result; stdflags(result); }
+:or.w         eaw_abs8_br     ,Rd    is eaw_abs8_br;      opcode=8  & Rd                 { result:2 = eaw_abs8_br      | Rd     ; Rd      = result; stdflags(result); }
+:or.w         eaw_abs16,Rd           is eaw_abs16;        opcode=8  & Rd [targetBase=Rd;]{ result:2 = eaw_abs16        | Rd     ; Rd      = result; stdflags(result); }
+:or.w         eaw_imm16       ,Rd    is eaw_imm16  ;      opcode=8  & Rd                 { result:2 = eaw_imm16        | Rd     ; Rd      = result; stdflags(result); }
+
+# NOT   <EAs>,Rd           Logical complement
+#       N = MSB(res)
+#       Z = res == 0
+#       V = 0
+#       C = unchanged
+:not.b        eab_direct             is eab_direct;       opcode_special=0x15 { result:1 = ~eab_direct[0,8]; eab_direct[0,8] = result; stdflags(result); }
+:not.b        eab_indirect           is eab_indirect;     opcode_special=0x15 { result:1 = ~eab_indirect   ; eab_indirect    = result; stdflags(result); }
+:not.b        eab_disp8              is eab_disp8;        opcode_special=0x15 { result:1 = ~eab_disp8      ; eab_disp8       = result; stdflags(result); }
+:not.b        eab_disp16             is eab_disp16;       opcode_special=0x15 { result:1 = ~eab_disp16     ; eab_disp16      = result; stdflags(result); }
+:not.b        eab_predec             is eab_predec;       opcode_special=0x15 { result:1 = ~eab_predec     ; eab_predec      = result; stdflags(result); }
+:not.b        eab_postinc            is eab_postinc;      opcode_special=0x15 { result:1 = ~eab_postinc    ; eab_postinc     = result; stdflags(result); }
+:not.b        eab_abs8_br            is eab_abs8_br;      opcode_special=0x15 { result:1 = ~eab_abs8_br    ; eab_abs8_br     = result; stdflags(result); }
+:not.b        eab_abs16              is eab_abs16;        opcode_special=0x15 { result:1 = ~eab_abs16      ; eab_abs16       = result; stdflags(result); }
+:not.b        eab_imm8               is eab_imm8   ;      opcode_special=0x15 { result:1 = ~eab_imm8       ; eab_imm8        = result; stdflags(result); }
+:not.w        eaw_direct             is eaw_direct;       opcode_special=0x15 { result:2 = ~eaw_direct     ; eaw_direct      = result; stdflags(result); }
+:not.w        eaw_indirect           is eaw_indirect;     opcode_special=0x15 { result:2 = ~eaw_indirect   ; eaw_indirect    = result; stdflags(result); }
+:not.w        eaw_disp8              is eaw_disp8;        opcode_special=0x15 { result:2 = ~eaw_disp8      ; eaw_disp8       = result; stdflags(result); }
+:not.w        eaw_disp16             is eaw_disp16;       opcode_special=0x15 { result:2 = ~eaw_disp16     ; eaw_disp16      = result; stdflags(result); }
+:not.w        eaw_predec             is eaw_predec;       opcode_special=0x15 { result:2 = ~eaw_predec     ; eaw_predec      = result; stdflags(result); }
+:not.w        eaw_postinc            is eaw_postinc;      opcode_special=0x15 { result:2 = ~eaw_postinc    ; eaw_postinc     = result; stdflags(result); }
+:not.w        eaw_abs8_br            is eaw_abs8_br;      opcode_special=0x15 { result:2 = ~eaw_abs8_br    ; eaw_abs8_br     = result; stdflags(result); }
+:not.w        eaw_abs16              is eaw_abs16;        opcode_special=0x15 { result:2 = ~eaw_abs16      ; eaw_abs16       = result; stdflags(result); }
+:not.w        eaw_imm16              is eaw_imm16  ;      opcode_special=0x15 { result:2 = ~eaw_imm16      ; eaw_imm16       = result; stdflags(result); }
+
+# XOR   <EAs>,Rd           XOR logical
+#       N = MSB(res)
+#       Z = res == 0
+#       V = 0
+#       C = unchanged
+:xor.b        eab_direct      ,Rd    is eab_direct;       opcode=12 & Rd                 { result:1 = eab_direct[0,8]  ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.b        eab_indirect    ,Rd    is eab_indirect;     opcode=12 & Rd                 { result:1 = eab_indirect     ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.b        eab_disp8       ,Rd    is eab_disp8;        opcode=12 & Rd                 { result:1 = eab_disp8        ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.b        eab_disp16      ,Rd    is eab_disp16;       opcode=12 & Rd                 { result:1 = eab_disp16       ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.b        eab_predec      ,Rd    is eab_predec;       opcode=12 & Rd                 { result:1 = eab_predec       ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.b        eab_postinc     ,Rd    is eab_postinc;      opcode=12 & Rd                 { result:1 = eab_postinc      ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.b        eab_abs8_br     ,Rd    is eab_abs8_br;      opcode=12 & Rd                 { result:1 = eab_abs8_br      ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.b        eab_abs16       ,Rd    is eab_abs16;        opcode=12 & Rd [targetBase=Rd;]{ result:1 = eab_abs16        ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.b        eab_imm8        ,Rd    is eab_imm8   ;      opcode=12 & Rd                 { result:1 = eab_imm8         ^ Rd[0,8]; Rd[0,8] = result; stdflags(result); }
+:xor.w        eaw_direct      ,Rd    is eaw_direct;       opcode=12 & Rd                 { result:2 = eaw_direct       ^ Rd     ; Rd      = result; stdflags(result); }
+:xor.w        eaw_indirect    ,Rd    is eaw_indirect;     opcode=12 & Rd                 { result:2 = eaw_indirect     ^ Rd     ; Rd      = result; stdflags(result); }
+:xor.w        eaw_disp8       ,Rd    is eaw_disp8;        opcode=12 & Rd                 { result:2 = eaw_disp8        ^ Rd     ; Rd      = result; stdflags(result); }
+:xor.w        eaw_disp16      ,Rd    is eaw_disp16;       opcode=12 & Rd                 { result:2 = eaw_disp16       ^ Rd     ; Rd      = result; stdflags(result); }
+:xor.w        eaw_predec      ,Rd    is eaw_predec;       opcode=12 & Rd                 { result:2 = eaw_predec       ^ Rd     ; Rd      = result; stdflags(result); }
+:xor.w        eaw_postinc     ,Rd    is eaw_postinc;      opcode=12 & Rd                 { result:2 = eaw_postinc      ^ Rd     ; Rd      = result; stdflags(result); }
+:xor.w        eaw_abs8_br     ,Rd    is eaw_abs8_br;      opcode=12 & Rd                 { result:2 = eaw_abs8_br      ^ Rd     ; Rd      = result; stdflags(result); }
+:xor.w        eaw_abs16,Rd           is eaw_abs16;        opcode=12 & Rd [targetBase=Rd;]{ result:2 = eaw_abs16        ^ Rd     ; Rd      = result; stdflags(result); }
+:xor.w        eaw_imm16       ,Rd    is eaw_imm16  ;      opcode=12 & Rd                 { result:2 = eaw_imm16        ^ Rd     ; Rd      = result; stdflags(result); }
+
+# MULXU <EAs>,Rd           Multiply extend as unsigned
+#       N = res s< 0
+#       Z = res == 0
+#       V = 0
+#       C = 0
+:mulxu.b      eab_direct      ,Rd    is eab_direct;       opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_direct      ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.b      eab_indirect    ,Rd    is eab_indirect;     opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_indirect    ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.b      eab_disp8       ,Rd    is eab_disp8;        opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_disp8       ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.b      eab_disp16      ,Rd    is eab_disp16;       opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_disp16      ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.b      eab_predec      ,Rd    is eab_predec;       opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_predec      ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.b      eab_postinc     ,Rd    is eab_postinc;      opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_postinc     ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.b      eab_abs8_br     ,Rd    is eab_abs8_br;      opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_abs8_br     ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.b      eab_abs16       ,Rd    is eab_abs16;        opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_abs16       ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.b      eab_imm8        ,Rd    is eab_imm8   ;      opcode=21 & Rd                 { op1:2 = zext(Rd[0,8]); op2:2 = zext(eab_imm8        ); result:2 = op1 * op2; Rd = result       ; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_direct      ,Rd    is eaw_direct;       opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_direct      ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_indirect    ,Rd    is eaw_indirect;     opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_indirect    ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_disp8       ,Rd    is eaw_disp8;        opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_disp8       ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_disp16      ,Rd    is eaw_disp16;       opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_disp16      ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_predec      ,Rd    is eaw_predec;       opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_predec      ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_postinc     ,Rd    is eaw_postinc;      opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_postinc     ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_abs8_br     ,Rd    is eaw_abs8_br;      opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_abs8_br     ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_abs16,Rd           is eaw_abs16;        opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_abs16       ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+:mulxu.w      eaw_imm16       ,Rd    is eaw_imm16  ;      opcode=21 & Rd                 { op1:4 = zext(Rd     ); op2:4 = zext(eaw_imm16       ); result:4 = op1 * op2; Rd = result[16,16]; rdNext:1 = &Rd + 2; *[register]:2 rdNext = result[0,16]; stdflags(result); $(CF) = 0; }
+
+# DIVXU <EAs>,Rd           Divide extend as unsigned
+#       N = res s< 0
+#       Z = res == 0
+#       V = 0
+#       C = 0
+#                                                                                          Rn+1                divisor                                                dividend                        check for DIV0    divide                  Check for overflow         modulo                   Store result
+:divxu.b      eab_direct      ,Rd    is eab_direct;       opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_direct      ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.b      eab_indirect    ,Rd    is eab_indirect;     opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_indirect    ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.b      eab_disp8       ,Rd    is eab_disp8;        opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_disp8       ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.b      eab_disp16      ,Rd    is eab_disp16;       opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_disp16      ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.b      eab_predec      ,Rd    is eab_predec;       opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_predec      ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.b      eab_postinc     ,Rd    is eab_postinc;      opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_postinc     ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.b      eab_abs8_br     ,Rd    is eab_abs8_br;      opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_abs8_br     ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.b      eab_abs16       ,Rd    is eab_abs16;        opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_abs16       ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.b      eab_imm8        ,Rd    is eab_imm8   ;      opcode=23 & Rd                 {                     op1:2 = zext(Rd[0,8]);                                 op2:2 = zext(eab_imm8        ); CheckDivide(op2); quotient:2 = op1 / op2; CheckOverflow8 (quotient); remainder:2 = op1 % op2; Rd[8,8] = remainder[0,8];  Rd[0,8]              = quotient[0,8] ; stdflags(quotient[0,8 ]); $(CF) = 0; }
+:divxu.w      eaw_direct      ,Rd    is eaw_direct;       opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_direct      ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+:divxu.w      eaw_indirect    ,Rd    is eaw_indirect;     opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_indirect    ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+:divxu.w      eaw_disp8       ,Rd    is eaw_disp8;        opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_disp8       ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+:divxu.w      eaw_disp16      ,Rd    is eaw_disp16;       opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_disp16      ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+:divxu.w      eaw_predec      ,Rd    is eaw_predec;       opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_predec      ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+:divxu.w      eaw_postinc     ,Rd    is eaw_postinc;      opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_postinc     ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+:divxu.w      eaw_abs8_br     ,Rd    is eaw_abs8_br;      opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_abs8_br     ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+:divxu.w      eaw_abs16       ,Rd    is eaw_abs16;        opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_abs16       ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+:divxu.w      eaw_imm16       ,Rd    is eaw_imm16  ;      opcode=23 & Rd                 { rdNext:1 = &Rd + 2; op1:4 = (zext(Rd) << 16) | zext(*[register]:2 rdNext); op2:4 = zext(eaw_imm16       ); CheckDivide(op2); quotient:4 = op1 / op2; CheckOverflow16(quotient); remainder:4 = op1 % op2; Rd      = remainder[0,16]; *[register]:2 rdNext = quotient[0,16]; stdflags(quotient[0,16]); $(CF) = 0; }
+
+# JMP   <EA>               Jump
+#       no flags
+:jmp       "@"^Rn_banked                   is opcode_special=0x11; mode = 13 & sz = 0 & Rn_banked
+{
+	addr:3 = 0; #zext(*:2 Rn_banked) | (zext(CP) << 16);
+	goto [addr];
+}
+:jmp       "@"^addr16_dp^":16"         is opcode_special=0x10; addr16_dp [targetBase=0;]
+{
+	addr:3 = zext(*:2 addr16_dp) | (zext(CP) << 16);
+	goto [addr];
+}
+:jmp       "@("^disp8^":8,"^Rs_banked^")"  is opcode_special=0x11; opcode=28 & Rs_banked; disp8 
+{
+	addr:3 = zext(*:2 (Rs_banked + disp8)) | (zext(CP) << 16);
+	goto [addr];
+}
+:jmp       "@("^disp16_banked^":8,"^Rs^")" is opcode_special=0x11; opcode=30 & Rs; disp16_banked [targetBase=Rs;]
+{
+	addr:3 = zext(*:2 disp16_banked) | (zext(CP) << 16);
+	goto [addr];
+}
+
+#absaddr24: "@"^addr24^":24" is addr24 { export *[const]:3 addr24; }
+absaddr24: "@"^addr24^":24" is addr24 { export * addr24; }
+
+# PJMP  @aa:24             Page jump
+#       no flags
+:pjmp      absaddr24 is opcode_special=0x13; absaddr24 { goto absaddr24; }
+:pjmp      "@"^Rs24        is opcode_special=0x11; opcode=0x19 & Rs24 { goto [Rs24]; }
+
+# JSR   <EA>               Jump to subroutine
+#       no flags
+:jsr       "@"^Rn_banked is opcode_special=0x11; mode=13 & sz=1 & Rn_banked
+{
+	pcNext:3 = inst_next;
+	    SP24 = SP24 - 2;
+	*:2 SP24 = pcNext[0,16];
+	  addr:3 = (zext(CP) << 16) | zext(*:2 Rn_banked);
+	    call   [addr];
+}
+:jsr       "@"^addr16^":16" is opcode_special=0x18; addr16
+{
+	pcNext:3 = inst_next;
+	SP24 = SP24 - 2;
+	*:2 SP24 = pcNext[0,16];
+	addr:3 = (zext(CP) << 16) | addr16;
+	call [addr];
+}
+
+# PJSR  <EA>               Page jump to subroutine
+#       no flags
+:pjsr    absaddr24  is opcode_special=3; absaddr24
+{
+    pcNext:3 = inst_next;
+	    SP24 = SP24 - 2;
+	*:2 SP24 = pcNext[0,16];
+	    SP24 = SP24 - 2;
+	*:2 SP24 = zext(pcNext[16,8]);
+	#   CP   = (absaddr24(2));      # may not be necessary, since I've aligned CP with PC, and the `call` instruction will set the whole 24-bit register
+	  #addr:3 = absaddr24;
+	    call    absaddr24 ;
+}
+:pjsr       "@"^Rs24      is opcode_special=0x11; opcode=0x18 & Rs24
+{
+    pcNext:3 = inst_next;
+	    SP24 = SP24 - 2;
+	*:2 SP24 = pcNext[0,16];
+	    SP24 = SP24 - 2;
+	*:2 SP24 = zext(pcNext[16,8]);
+	    call   [Rs24];
+}
+#:pjsr      "@"^Rs        is opcode_special=0x11; Rs & opcode=0x18 
+#{
+#	rsNext:1 = &Rs + 2;
+#    pcNext:3 = inst_next;
+#	    SP24 = SP24 - 2;
+#	*:2 SP24 = pcNext[0,16];
+#	    SP24 = SP24 - 2;
+#	*:2 SP24 = zext(pcNext[16,8]);
+#	  addr:3 = (zext(Rs[0,8]) << 16) | zext(*[register]:2 rsNext);
+#	    call   [addr];
+#}
+
+# BSR   disp
+#       no flags
+:bsr    reloffs8           is opcode_special=0x0e; reloffs8 
+{
+	pcNext:3 = inst_next;
+	SP24 = SP24 - 2;
+	*:2 SP24 = pcNext[0,16];
+	call reloffs8; 
+}
+:bsr    reloffs16          is opcode_special=0x1e; reloffs16
+{
+	pcNext:3 = inst_next;
+	SP24 = SP24 - 2;
+	*:2 SP24 = pcNext;
+	call reloffs16; 
+}
+
+# LINK  FP,#xx             Link stack
+#       no flags
+:link      "FP",s8                      is mode=1 & sz=0 & Rn=7; s8
+{
+	    SP24 = SP24 - 2;
+	*:2 SP24 = FP;
+	    FP24 = SP24;
+	    SP24 = SP24 + sext(s8);
+}
+:link      "FP",s16                     is mode=1 & sz=1 & Rn=7; s16
+{
+	    SP24 = SP24 - 2;
+	*:2 SP24 = FP;
+	    FP   = SP;
+	    SP24 = SP24 + sext(s16);
+}
+
+# MOV:E #xx:8,Rd           Move data:E, short format
+#       N: res s< 0
+#       Z: res == 0
+#       V: 0
+#       C: unchanged
+:mov:"e" i8,Rn                          is mode=5 & sz=0 & Rn; i8 { Rn[0,8] = i8; $(NF) = i8 s< 0; $(ZF) = i8 == 0; $(VF) = 0; }
+
+# MOV:I #xx:8,Rd           Move data:I, short format
+#       N: res s< 0
+#       Z: res == 0
+#       V: 0
+#       C: unchanged
+:mov:"i" i16,Rn                         is mode=5 & sz=1 & Rn; i16 { Rn = i16; $(NF) = i16 s< 0; $(ZF) = i16 == 0; $(VF) = 0; }
+
+# RTS                      Return from subroutine
+#       no flags
+:rts                                    is opcode_special=0x19
+{
+	pc24:3 = (zext(CP) << 16) | zext(*:2 SP24);
+	SP24 = SP24 + 2;
+	return [pc24];
+}
+
+# PRTS                     Page return from subroutine
+#       no flags
+:prts                                   is opcode_special=0x11; opcode_special=0x19
+{
+	cp24:3 = zext(*:2 SP24) << 16;
+	SP24 = SP24 + 2;
+	pc24:3  = zext(*:2 SP24) | cp24;
+	SP24 = SP24 + 2;
+	return [pc24];
+}
+
+# PRTD  #xx                Page return and deallocate
+#       no flags
+:prtd    s8                             is opcode_special=0x11; opcode_special=0x14; s8 
+{
+	cp24:3 = zext(*:1 SP24) << 16;
+	SP24 = SP24 + 2;
+	pc24:3  = zext(*:2 SP24) | cp24;
+	SP24 = SP24 + 2;
+	SP24 = SP24 + sext(s8);
+	return [pc24];
+}
+:prtd    s16                            is opcode_special=0x11; opcode_special=0x1C; s16
+{
+	cp24:3 = zext(*:1 SP24) << 16;
+	SP24 = SP24 + 2;
+	pc24:3  = zext(*:2 SP24) | cp24;
+	SP24 = SP24 + 2;
+	SP24 = SP24 + sext(s16);
+	return [pc24];
+}
+
+# RTE
+#       flags are restored from the stack
+:rte                                    is opcode_special=0xA
+{
+	SR = *:2 SP24;
+	SpreadFlags();
+	SP24 = SP24 + 2;
+
+	cp16 = *:2 SP24;
+	CP = cp16:1;
+	SP24 = SP24 + 2;
+
+	pc24:3 = zext(*:2 SP24) | (zext(cp16) << 16);
+	SP24 = SP24 + 2;
+	return [pc24];
+}
+
+# UNLK                     Unlink stack
+#       no flags
+:unlk    "FP"                           is opcode_special=0xF
+{
+	SP24 =     FP24;
+	  FP = *:2 SP24;
+	SP24 = SP24 + 2;
+}
+
+r6b_disp8: "@("^disp8^":8","FP"^")" is disp8 {
+	local addr:3 = FP24 + disp8;
+	export *:1 addr;
+}
+r6w_disp8: "@("^disp8^":8","FP"^")" is disp8 {
+	local addr:3 = FP24 + disp8;
+	export *:2 addr;
+}
+
+# MOV:L #xx:8,Rd           Move data:S, short format
+#       N: res s< 0
+#       Z: res == 0
+#       V: 0
+#       C: unchanged
+:mov:"l.b" "@"^addr8_br^":8",Rd   is opcode=12 & Rd; addr8_br   { Rd[0,8] = *:1 addr8_br; $(NF) = Rd[7,1];  $(ZF) = Rd[0,8] == 0; $(VF) = 0; }
+:mov:"l.w" "@"^addr8_br^":8",Rd   is opcode=13 & Rd; addr8_br   { Rd      = *:2 addr8_br; $(NF) = Rd[15,1]; $(ZF) = Rd      == 0; $(VF) = 0; }
+# MOV:S #xx:8,Rd           Move data:S, short format
+#       N: res s< 0
+#       Z: res == 0
+#       V: 0
+#       C: unchanged
+:mov:"s.b" Rs,"@"^addr8_br^":8"   is opcode=14 & Rs; addr8_br   { *:1 addr8_br = Rs[0,8]; $(NF) = Rs[7,1];  $(ZF) = Rs[0,8] == 0; $(VF) = 0; }
+:mov:"s.w" Rs,"@"^addr8_br^":8"   is opcode=15 & Rs; addr8_br   { *:2 addr8_br = Rs;      $(NF) = Rs[15,1]; $(ZF) = Rs      == 0; $(VF) = 0; }
+# MOV:F #xx:8,Rd           Move data:F, short format
+#       N: res s< 0
+#       Z: res == 0
+#       V: 0
+#       C: unchanged
+:mov:"f.b" r6b_disp8,Rd           is opcode=16 & Rd; r6b_disp8  { Rd[0,8] = r6b_disp8;    $(NF) = Rd[7,1];  $(ZF) = Rd[0,8] == 0; $(VF) = 0; }
+:mov:"f.w" r6w_disp8,Rd           is opcode=17 & Rd; r6w_disp8  { Rd      = r6w_disp8;    $(NF) = Rd[15,1]; $(ZF) = Rd      == 0; $(VF) = 0; }
+:mov:"f.b" Rs,r6b_disp8           is opcode=18 & Rs; r6b_disp8  { r6b_disp8 = Rs[0,8];    $(NF) = Rs[7,1];  $(ZF) = Rs[0,8] == 0; $(VF) = 0; }
+:mov:"f.w" Rs,r6w_disp8           is opcode=19 & Rs; r6w_disp8  { r6w_disp8 = Rs;         $(NF) = Rs[15,1]; $(ZF) = Rs      == 0; $(VF) = 0; }
+
+# Bcc   disp               Branch conditionally
+#       no flags
+:b^cc      "#"^reloffs8^":8"    is   opcode47=2 & cc; reloffs8 { if (cc) goto reloffs8; }
+:b^cc      "#"^reloffs16^":16"  is   opcode47=3 & cc; reloffs16 { if (cc) goto reloffs16; }
+
+# SCB/cc Rn,disp           Subtract, compare and branch conditionally
+#        no flags
+:scb/"f"   Rs, reloffs8         is   opcode_special=1; opcode=23 & Rs; reloffs8          
+{
+	Rs = Rs - 1;
+	if (Rs != 0xFFFF) goto reloffs8;
+}
+:scb/"ne"  Rs, reloffs8         is   opcode_special=6; opcode=23 & Rs; reloffs8          
+{
+	if (!$(ZF)) goto inst_next;
+	Rs = Rs - 1;
+	if (Rs != 0xFFFF) goto reloffs8;
+}
+:scb/"eq"  Rs, reloffs8         is   opcode_special=7; opcode=23 & Rs; reloffs8          
+{
+	if ($(ZF)) goto inst_next;
+	Rs = Rs - 1;
+	if (Rs != 0xFFFF) goto reloffs8;
+}
+
+trapVector: address is op_imm4 [ address = 0x40 + 4 * op_imm4; ] { export * address; }
+# TRAPA  #xx               Trap always
+#        no flags
+:trapa "#"^trapVector    is opcode_special=8; opcode47=1 & trapVector
+{
+	addr:4 = inst_next;
+	PUSH(addr[0,16]);
+	PUSH(addr[16,16]);
+	PUSH(SR[0,16]);
+	call [*:3 trapVector];
+}
+
+:nop                    is opcode_special=0 { }

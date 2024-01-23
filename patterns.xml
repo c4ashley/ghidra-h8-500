@@ -1,0 +1,6 @@
+<patternlist>
+  <pattern>
+      <data>0x17xx12xxaf0dd79ce7019d</data>  <!-- LINK #.. : STM (..),@-SP : ADD #-2, SP : STC EP, @SP : STC DP, @(1,SP) -->
+     <funcstart after="data" /> <!-- must be something defined right before this, or no memory -->
+  </pattern>
+</patternlist>

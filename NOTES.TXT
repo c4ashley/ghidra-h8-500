@@ -1,0 +1,133 @@
+=== TODO, BUGS, ETC ===
+
+Function purges are not automatically determined. X86 stcdall purges seem to be analysed
+by a plugin ("ghidra.app.plugin.core.function.X86FunctionPurgeAnalyzer") so a plugin is
+probably needed to sort this out for the H8/500, too.
+
+Still having trouble with the decompiler being "unable to track spacebase fully for stack."
+This may be responsible for the decompiler having difficulty assigning local variables.
+
+Maybe consider making all general registers 24-bit (or giving them access to a 24-bit
+extension) with copies of DP/EP/TP in the high byte, like I've already done for FP/SP.
+Maybe this will make it easier for the decompiler to understand pointers, etc. Though
+it will probably make it harder to do 32-bit maths, such as MULXU where the result is
+in R0:R1.
+
+Also maybe consider padding all 24-bit things to 32-bit.
+
+Some preserved (unaffected) registers are still showing in the decompilation as being
+manually stored and restored.
+
+My apologies to the original author. I've extended their work for the H8/520 but I have
+no knowledge of the H8/538 so for all I know, I've completely destroyed the H8/538 code.
+
+
+__________________________________________________________________________________________
+=== General notes on H8/500 ===
+
+=== Addressing modes ===
+Sz: 1=word
+    0=byte
+ r: 0~7 = use R0~R7 register
+Register Direct
+  Rn		1 0 1 0 Sz r r r 	EA = Rn
+Register Indirect
+  @Rn		1 1 0 1 Sz r r r 	EA = 0:15  Rn
+                                     16:23 DP/TP/EP
+Register Indirect with Displacement
+  @(d:8,Rn)	1 1 1 0 Sz r r r	EA = 0:15  (Rn + sign-extended displacement)
+                                     16:23 DP/TP/EP
+  @(d:16,Rn)	1 1 1 1 Sz r r r	EA = 0:15  (Rn + displacement)
+                                     16:23 DP/TP/EP
+Register Indirect with Pre/Post-Decrement
+  @-Rn		1 0 1 1 Sz r r r    EA = 0:15  (Rn - (1 or 2, based on Sz))
+                                     16:23 DP/TP/EP (ignored in Minimum mode)
+  @Rn+		1 1 0 0 Sz r r r    EA = 0:15  Rn
+                                     16:23 DP/TP/EP (ignored in Minimum mode)
+Immediate
+  #xx:8		0 0 0 0 0 1 0 0 	1-byte immediate
+  #xx:16	0 0 0 0 1 1 0 0		2-byte immediate
+Absolute
+  @aa:8		0 0 0 0 Sz 1 0 1 	EA = 0:7   EA extension data
+                                             8:15  BR
+									 16:23 0x00
+  @aa:16	0 0 0 1 Sz 1 0 1	EA = 0:15  EA extension data
+                                             16:23 DP
+PC-Relative
+  disp		No EA field. Specified in op-code.
+      :8                        	EA = 0:15  (PC + sign-extended displacement)
+	                                     16:23 CP
+      :16                       	EA = 0:15  (PC + displacement)
+	                                     16:23 CP
+
+Where a choice between DP/TP/EP is available, the choice is automatically determined by the choice of general register Rn. For R0~R3, DP is used. For R4~R5, EP is used. For R6~R6 (SP,BP), TP is used.
+
+
+=== Exception Vector Table ===
+In Minimum mode, the vector addresses are 2-byte words located at N*2, where N is the exception index.
+In Maximum mode, the vector addresses are 4-byte words located at N*4, where N is the exception index.
+N	Exception
+0	Reset
+1	-- (reserved)
+2	Invalid Instruction
+3	DIVXU instruction (zero divide)
+4	TRAP/VS instruction
+5	-- (reserved)
+6	-- (reserved)
+7	-- (reserved)
+8	Address error
+9	Trace
+10	-- (reserved)
+11	Nonmaskable external interrupt (NMI)
+12	-- (reserved)
+13	-- (reserved)
+14	-- (reserved)
+15	-- (reserved)
+16	TRAPA instruction
+17	TRAPA instruction
+18	TRAPA instruction
+19	TRAPA instruction
+20	TRAPA instruction
+21	TRAPA instruction
+22	TRAPA instruction
+23	TRAPA instruction
+24	TRAPA instruction
+25	TRAPA instruction
+26	TRAPA instruction
+27	TRAPA instruction
+28	TRAPA instruction
+29	TRAPA instruction
+30	TRAPA instruction
+31	TRAPA instruction
+32	External interrupt IRQ0
+33	External interrupt IRQ1
+34	External interrupt IRQ2
+35	External interrupt IRQ3
+36	External interrupt IRQ4
+37	External interrupt IRQ5
+38	External interrupt IRQ6
+39	External interrupt IRQ7
+40	Internal interrupt 0:   FRT1.ICI
+41	Internal interrupt 1:   FRT1.OCIA
+42	Internal interrupt 2:   FRT1.OCIB
+43	Internal interrupt 3:   FRT1.FOVI
+44	Internal interrupt 4:   FRT2.ICI
+45	Internal interrupt 5:   FRT2.OCIA
+46	Internal interrupt 6:   FRT2.OCIB
+47	Internal interrupt 7:   FRT2.FOVI
+48	Internal interrupt 8:   Timer.CMIA
+49	Internal interrupt 9:   Timer.CMIB
+50	Internal interrupt 10:  Timer.OVI
+51	Internal interrupt 11:  
+52	Internal interrupt 12:  SCI1.ERI
+53	Internal interrupt 13:  SCI1.RXI
+54	Internal interrupt 14:  SCI1.TXI
+55	Internal interrupt 15:  
+56	Internal interrupt 16:  SCI2.ERI
+57	Internal interrupt 17:  SCI2.RXI
+58	Internal interrupt 18:  SCI2.TXI
+59	Internal interrupt 19:  
+60	Internal interrupt 20:  ADC.ADI    
+61	Internal interrupt 21:   
+62	Internal interrupt 22:   
+63	Internal interrupt 23:   

@@ -1,5 +1,17 @@
+GHIDRADIR := ${HOME}/Downloads/ghidra/ghidra_11.1_DEV
+PROCDIR := $(GHIDRADIR)/Ghidra/Processors/h8
+#DEBUGARGS := -x -u -l -n -t -c -f -o
+DEBUGARGS := 
+SLEIGHARGS := $(DEBUGARGS) -a
+#SLEIGHARGS := $(DEBUGARGS) h8520
+
 build:
-	/home/mkennedy/ghidra/ghidra_10.3_PUBLIC/support/sleigh -a $$PWD
+	$(GHIDRADIR)/support/sleigh $(SLEIGHARGS) $$PWD
 
 install:
-	rsync -av --delete /home/mkennedy/eclipse-workspace/gh8/data/languages/ /home/mkennedy/ghidra/ghidra_10.3_PUBLIC/Ghidra/Processors/h8/data/languages
+	mkdir -p $(PROCDIR)/data/languages
+	rsync -av --delete --exclude='*.xml' $$PWD $(PROCDIR)/data/languages
+	mkdir -p $(PROCDIR)/data/patterns
+	cp pattern*.xml $(PROCDIR)/data/patterns/
+	touch $(PROCDIR)/Module.manifest
+	echo $(SLEIGHARGS) > $(PROCDIR)/data/sleighArgs.txt

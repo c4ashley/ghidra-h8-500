@@ -1,0 +1,7 @@
+<patternconstraints>
+  <language id="H8:BE:16:H8520Max">
+    <compiler id="default">
+      <patternfile>patterns.xml</patternfile>
+    </compiler>
+  </language>
+</patternconstraints>
