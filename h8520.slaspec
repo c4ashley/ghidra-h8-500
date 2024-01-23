@@ -557,6 +557,16 @@ reloffs16: reloc is disp16       [ reloc=(inst_next & 0xFF0000) | ((inst_next+di
 :mov:"g.w"    i16,eaw_postinc           is eaw_postinc     ; opcode_special=7; i16                 { eaw_postinc  = i16;           stdflags(i16); }
 :mov:"g.w"    i16,eaw_abs8_br           is eaw_abs8_br     ; opcode_special=7; i16                 { eaw_abs8_br  = i16;           stdflags(i16); }
 :mov:"g.w"    i16,eaw_abs16             is eaw_abs16;        opcode_special=7; i16                 { eaw_abs16 = i16;       stdflags(i16); }
+# according to IDA Pro, storing a 16-bit immediate in an 8-bit register is valid assembly,
+# but I do not know how it executes (if indeed it does).
+# For the sake of brevity, let's just assume it stores the low byte
+:mov:"g.w"    i16,eab_indirect          is eab_indirect    ; opcode_special=7; i16                 { eab_indirect[0,8] = i16[0,8];       stdflags(i16[0,8]); }
+:mov:"g.w"    i16,eab_disp8             is eab_disp8       ; opcode_special=7; i16                 { eab_disp8   [0,8] = i16[0,8];       stdflags(i16[0,8]); }
+:mov:"g.w"    i16,eab_disp16            is eab_disp16      ; opcode_special=7; i16                 { eab_disp16  [0,8] = i16[0,8];       stdflags(i16[0,8]); }
+:mov:"g.w"    i16,eab_predec            is eab_predec      ; opcode_special=7; i16                 { eab_predec  [0,8] = i16[0,8];       stdflags(i16[0,8]); }
+:mov:"g.w"    i16,eab_postinc           is eab_postinc     ; opcode_special=7; i16                 { eab_postinc [0,8] = i16[0,8];       stdflags(i16[0,8]); }
+:mov:"g.w"    i16,eab_abs8_br           is eab_abs8_br     ; opcode_special=7; i16                 { eab_abs8_br [0,8] = i16[0,8];       stdflags(i16[0,8]); }
+:mov:"g.w"    i16,eab_abs16             is eab_abs16;        opcode_special=7; i16                 { eab_abs16   [0,8] = i16[0,8];       stdflags(i16[0,8]); }
 
 # ADD:G <EAs>,Rd           Add, general format
 #       N: result s< 0

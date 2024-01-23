@@ -18,6 +18,15 @@ Also maybe consider padding all 24-bit things to 32-bit.
 Some preserved (unaffected) registers are still showing in the decompilation as being
 manually stored and restored.
 
+MOV:G.B #xx:16,<EAd> makes little sense, moving a 16-bit immediate into an 8-bit
+register. It does disassemble in IDA, but the only time I encountered the instruction
+was in my own code, assembled with the Macroassembler. I'm suspicious as to whether it
+actually executes on the microprocessor, and if it does, how. Could this be the reason
+I've been having trouble with my own code? (TODO: Write some test code that explores
+the behaviour of this instruction.) Is there a way to have Ghidra throw warnings during
+the disassembly process, or flag the addresses with this instruction, without making a
+plugin?
+
 My apologies to the original author. I've extended their work for the H8/520 but I have
 no knowledge of the H8/538 so for all I know, I've completely destroyed the H8/538 code.
 
