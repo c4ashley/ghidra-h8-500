@@ -1,7 +1,7 @@
 # Hitachi H8/500 Processor for Ghidra
 
 This is a processor definition for the Hitachi H8/500 family of microprocessors for Ghidra.
-It was based on [Martin Kennedy][author]'s [Gitea repository][repo].
+It was based on [Martin Kennedy][laboratoryb]'s [Gitea repository][repo].
 and I've added functionality for the H8/520 in maximum mode. Unfortunately I do not think there's a
 way to cross-fork.
 His repo focuses on the H8/538, and is still under active development as of 2024-01-23, so make sure
