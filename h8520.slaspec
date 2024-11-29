@@ -1174,6 +1174,7 @@ reloffs16: reloc is disp16       [ reloc=(inst_next & 0xFF0000) | ((inst_next+di
 :cmp:"g.b"    i8,eab_postinc           is eab_postinc;   opcode_special=4; i8  { subflags(eab_postinc, i8); }
 :cmp:"g.b"    i8,eab_abs8_br           is eab_abs8_br;   opcode_special=4; i8  { subflags(eab_abs8_br, i8); }
 :cmp:"g.b"    i8,eab_abs16             is eab_abs16;     opcode_special=4; i8  { subflags(eab_abs16, i8); }
+:cmp:"g.b"    i8,eaw_abs16             is eaw_abs16;     opcode_special=4; i8  { subflags(eaw_abs16, zext(i8)); } # TODO: Confirm in hardware if this opcode zero- or sign-extends the immediate.
 :cmp:"g.b"    i8,eab_imm8              is eab_imm8;      opcode_special=4; i8  { subflags(eab_imm8, i8); }
 :cmp:"g.w"    i16,eaw_direct           is eaw_direct;    opcode_special=5; i16 { subflags(eaw_direct, i16); }
 :cmp:"g.w"    i16,eaw_indirect         is eaw_indirect;  opcode_special=5; i16 { subflags(eaw_indirect, i16); }
